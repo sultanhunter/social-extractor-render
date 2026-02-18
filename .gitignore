@@ -1,0 +1,4 @@
+node_modules/
+.env
+instagram_cookies.txt
+npm-debug.log*

@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: social-extractor
+    env: docker
+    autoDeploy: true
+    healthCheckPath: /health
