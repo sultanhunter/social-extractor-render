@@ -282,6 +282,38 @@ async function resolveTikTokUrl(url, requestId, sessionId) {
     );
   }
 
+  // Fallback: resolve canonical webpage URL via yt-dlp (works without curl).
+  try {
+    const binary = process.env.YT_DLP_PATH || "yt-dlp";
+    const args = ["--print", "webpage_url", "--skip-download", "--no-warnings"];
+    if (proxy) args.push("--proxy", proxy);
+    args.push(trimmed);
+
+    const { stdout } = await execFileAsync(binary, args, {
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+    });
+
+    const resolved = String(stdout || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => isHttpUrl(line))
+      .find((line) => !line.includes("/notfound"));
+
+    if (resolved) {
+      if (resolved !== trimmed) {
+        console.log(
+          `${getLogPrefix(requestId)} tiktok_url_resolved extractor=yt-dlp from=${trimmed} to=${resolved}`
+        );
+      }
+      return resolved;
+    }
+  } catch (error) {
+    console.warn(
+      `${getLogPrefix(requestId)} tiktok_url_resolve_failed ${formatExecError("yt-dlp", error)}`
+    );
+  }
+
   return trimmed;
 }
 
