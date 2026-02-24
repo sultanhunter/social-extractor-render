@@ -26,6 +26,85 @@ function dedupe(urls) {
   return Array.from(new Set(urls.filter(Boolean)));
 }
 
+function normalizeEscapedUrl(url) {
+  if (typeof url !== "string") return "";
+  return url
+    .trim()
+    .replace(/\\u0026/g, "&")
+    .replace(/\\\//g, "/")
+    .replace(/\\u002F/g, "/")
+    .replace(/\\u003D/g, "=")
+    .replace(/\\u0025/g, "%")
+    .replace(/\\"/g, '"');
+}
+
+function hasImageExtension(pathnameWithQuery) {
+  return /\.(jpe?g|png|webp|gif|bmp)(\?|$)/i.test(pathnameWithQuery);
+}
+
+function isLikelyDirectMediaUrl(url, platform) {
+  if (!isHttpUrl(url)) return false;
+
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const pathWithQuery = `${parsed.pathname}${parsed.search}`.toLowerCase();
+
+    if (platform !== "tiktok") {
+      return true;
+    }
+
+    if (host === "www.tiktok.com" || host === "m.tiktok.com" || host === "tiktok.com") {
+      return false;
+    }
+
+    if (pathWithQuery.includes("/notfound") || pathWithQuery.startsWith("/t/")) {
+      return false;
+    }
+
+    if (pathWithQuery.includes("mime_type=audio") || pathWithQuery.includes("mime_type=video")) {
+      return false;
+    }
+
+    if (pathWithQuery.includes("/video/")) {
+      return false;
+    }
+
+    if (hasImageExtension(pathWithQuery)) {
+      return true;
+    }
+
+    const likelyCdnHost =
+      host.includes("tiktokcdn") ||
+      host.includes("byteoversea") ||
+      host.includes("bytedance") ||
+      host.includes("ibytedtos") ||
+      host.includes("muscdn") ||
+      host.includes("snssdk") ||
+      host.includes("akamaized") ||
+      host.includes("cloudfront");
+
+    const likelyMediaPath =
+      pathWithQuery.includes("/obj/") ||
+      pathWithQuery.includes("/tos-") ||
+      pathWithQuery.includes("/image/") ||
+      pathWithQuery.includes("photomode") ||
+      pathWithQuery.includes("mime_type=image");
+
+    return likelyCdnHost && likelyMediaPath;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeAndFilterMediaUrls(urls, platform) {
+  return dedupe(
+    (Array.isArray(urls) ? urls : [])
+      .map((item) => normalizeEscapedUrl(item))
+      .filter((item) => isLikelyDirectMediaUrl(item, platform))
+  );
+}
+
 function toSingleLine(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
@@ -111,32 +190,26 @@ function resolveInstagramCookiesFile() {
   return null;
 }
 
-function getLargestThumbnail(entry) {
-  if (!Array.isArray(entry.thumbnails)) return null;
+function getThumbnailUrls(entry) {
+  if (!Array.isArray(entry.thumbnails)) return [];
 
-  const candidates = entry.thumbnails
-    .map((item) => (item && typeof item === "object" ? item : null))
-    .filter(Boolean)
-    .map((thumb) => ({
-      url: isHttpUrl(thumb.url) ? thumb.url : null,
-      area:
-        typeof thumb.width === "number" && typeof thumb.height === "number"
-          ? thumb.width * thumb.height
-          : 0,
-    }))
-    .filter((thumb) => thumb.url)
-    .sort((a, b) => b.area - a.area);
-
-  return candidates[0] ? candidates[0].url : null;
+  return dedupe(
+    entry.thumbnails
+      .map((item) => (item && typeof item === "object" ? item : null))
+      .filter(Boolean)
+      .map((thumb) => (isHttpUrl(thumb.url) ? thumb.url : null))
+      .filter(Boolean)
+  );
 }
 
 function extractUrlsFromEntry(entry) {
   const urls = [];
+  if (!entry || typeof entry !== "object") return [];
+
   if (isHttpUrl(entry.url)) urls.push(entry.url);
   if (isHttpUrl(entry.thumbnail)) urls.push(entry.thumbnail);
 
-  const largestThumb = getLargestThumbnail(entry);
-  if (largestThumb) urls.push(largestThumb);
+  urls.push(...getThumbnailUrls(entry));
 
   if (Array.isArray(entry.formats)) {
     for (const format of entry.formats) {
@@ -168,6 +241,50 @@ function parseYtDlpStdout(stdout) {
   throw new Error("Failed to parse yt-dlp JSON output");
 }
 
+async function resolveTikTokUrl(url, requestId, sessionId) {
+  const trimmed = String(url || "").trim();
+  const isShortUrl = /tiktok\.com\/(t\/|@[^/]+\/video\/|vm\.tiktok\.com)/i.test(trimmed);
+  if (!isShortUrl) return trimmed;
+
+  const proxy = getProxyUrl(sessionId);
+  const args = [
+    "-Ls",
+    "-o",
+    "/dev/null",
+    "-A",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "-w",
+    "%{url_effective}",
+  ];
+
+  if (proxy) {
+    args.push("--proxy", proxy);
+  }
+
+  args.push(trimmed);
+
+  try {
+    const { stdout } = await execFileAsync("curl", args, {
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+    });
+
+    const resolved = String(stdout || "").trim();
+    if (isHttpUrl(resolved) && !resolved.includes("/notfound")) {
+      if (resolved !== trimmed) {
+        console.log(`${getLogPrefix(requestId)} tiktok_url_resolved from=${trimmed} to=${resolved}`);
+      }
+      return resolved;
+    }
+  } catch (error) {
+    console.warn(
+      `${getLogPrefix(requestId)} tiktok_url_resolve_failed ${formatExecError("curl", error)}`
+    );
+  }
+
+  return trimmed;
+}
+
 async function runGalleryDl(url, platform, requestId, sessionId) {
   const binary = process.env.GALLERY_DL_PATH || "gallery-dl";
   const proxy = getProxyUrl(sessionId);
@@ -189,15 +306,17 @@ async function runGalleryDl(url, platform, requestId, sessionId) {
       maxBuffer: 10 * 1024 * 1024,
     });
 
-    const mediaUrls = dedupe(
+    const rawUrls = dedupe(
       String(stdout)
         .split("\n")
-        .map((line) => line.trim())
+        .map((line) => normalizeEscapedUrl(line))
         .filter((line) => isHttpUrl(line))
     );
 
+    const mediaUrls = normalizeAndFilterMediaUrls(rawUrls, platform);
+
     console.log(
-      `${getLogPrefix(requestId)} gallery-dl success elapsedMs=${Date.now() - startedAt} media=${mediaUrls.length}`
+      `${getLogPrefix(requestId)} gallery-dl success elapsedMs=${Date.now() - startedAt} media=${mediaUrls.length} raw=${rawUrls.length}`
     );
 
     return mediaUrls;
@@ -242,13 +361,15 @@ async function runYtDlp(url, platform, requestId, sessionId) {
       ? payload.entries.filter((item) => item && typeof item === "object")
       : [];
 
-    const mediaUrls =
+    const rawUrls =
       entries.length > 0
         ? dedupe(entries.flatMap((entry) => extractUrlsFromEntry(entry)))
         : extractUrlsFromEntry(payload);
 
+    const mediaUrls = normalizeAndFilterMediaUrls(rawUrls, platform);
+
     console.log(
-      `${getLogPrefix(requestId)} yt-dlp success elapsedMs=${Date.now() - startedAt} media=${mediaUrls.length}`
+      `${getLogPrefix(requestId)} yt-dlp success elapsedMs=${Date.now() - startedAt} media=${mediaUrls.length} raw=${rawUrls.length}`
     );
 
     return {
@@ -319,15 +440,19 @@ app.post("/api/extract-social-post", async (req, res) => {
   }
 
   const safeSessionId = typeof sessionId === "string" && sessionId.trim() ? sessionId : undefined;
+  const extractionUrl =
+    resolvedPlatform === "tiktok"
+      ? await resolveTikTokUrl(url, requestId, safeSessionId)
+      : String(url).trim();
 
   console.log(
-    `${logPrefix} start platform=${resolvedPlatform} session=${safeSessionId || "none"} proxy=${getProxyUrl(safeSessionId) ? "yes" : "no"} cookies=${resolveInstagramCookiesFile() ? "yes" : "no"}`
+    `${logPrefix} start platform=${resolvedPlatform} session=${safeSessionId || "none"} proxy=${getProxyUrl(safeSessionId) ? "yes" : "no"} cookies=${resolveInstagramCookiesFile() ? "yes" : "no"} url=${extractionUrl}`
   );
 
   const errors = [];
 
   try {
-    const galleryUrls = await runGalleryDl(url, resolvedPlatform, requestId, safeSessionId);
+    const galleryUrls = await runGalleryDl(extractionUrl, resolvedPlatform, requestId, safeSessionId);
     if (galleryUrls.length > 0) {
       console.log(`${logPrefix} success extractor=gallery-dl media=${galleryUrls.length}`);
       return res.json({
@@ -347,7 +472,7 @@ app.post("/api/extract-social-post", async (req, res) => {
   }
 
   try {
-    const ytData = await runYtDlp(url, resolvedPlatform, requestId, safeSessionId);
+    const ytData = await runYtDlp(extractionUrl, resolvedPlatform, requestId, safeSessionId);
     if (ytData.mediaUrls.length > 0) {
       console.log(`${logPrefix} success extractor=yt-dlp media=${ytData.mediaUrls.length}`);
       return res.json({ ...ytData, requestId });
