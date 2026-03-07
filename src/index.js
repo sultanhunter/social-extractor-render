@@ -15,6 +15,13 @@ const app = express();
 const port = Number(process.env.PORT) || 3000;
 let generatedCookiesPath = null;
 
+const DEFAULT_FRAME_COUNT = 6;
+const MIN_FRAME_COUNT = 2;
+const MAX_FRAME_COUNT = 12;
+const DEFAULT_FRAME_WIDTH = 960;
+const MIN_FRAME_WIDTH = 480;
+const MAX_FRAME_WIDTH = 1440;
+
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -97,6 +104,51 @@ function isLikelyDirectMediaUrl(url, platform) {
   }
 }
 
+function isLikelyVideoUrl(url) {
+  if (!isHttpUrl(url)) return false;
+
+  const lower = String(url).toLowerCase();
+
+  if (lower.includes("mime_type=audio") || lower.includes("/audio/")) {
+    return false;
+  }
+
+  return (
+    /\.(mp4|mov|webm|m4v|m3u8)(\?|$)/i.test(lower) ||
+    lower.includes("mime_type=video") ||
+    lower.includes("/video/") ||
+    lower.includes("/play/") ||
+    lower.includes("/aweme/v1/play")
+  );
+}
+
+function scoreVideoUrl(url) {
+  const lower = String(url).toLowerCase();
+  let score = 0;
+
+  if (lower.includes(".mp4")) score += 50;
+  if (lower.includes("mime_type=video")) score += 35;
+  if (lower.includes("/play/") || lower.includes("/aweme/v1/play")) score += 20;
+  if (lower.includes(".m3u8")) score -= 20;
+  if (lower.includes("audio")) score -= 60;
+
+  return score;
+}
+
+function prioritizeVideoUrls(urls) {
+  return dedupe(urls)
+    .filter((url) => isLikelyVideoUrl(url))
+    .sort((a, b) => scoreVideoUrl(b) - scoreVideoUrl(a));
+}
+
+function toBoundedInteger(value, fallback, min, max) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < min) return min;
+  if (parsed > max) return max;
+  return parsed;
+}
+
 function normalizeAndFilterMediaUrls(urls, platform) {
   return dedupe(
     (Array.isArray(urls) ? urls : [])
@@ -136,6 +188,24 @@ function getBearerToken(authHeader) {
   const [scheme, token] = authHeader.split(" ");
   if (!scheme || !token || scheme.toLowerCase() !== "bearer") return null;
   return token;
+}
+
+function authorizeRequest(req, res, requestId) {
+  const requiredToken = process.env.SOCIAL_EXTRACTOR_API_TOKEN || process.env.EXTRACTOR_API_TOKEN;
+  const providedToken = getBearerToken(req.headers.authorization);
+
+  if (requiredToken && providedToken !== requiredToken) {
+    const logPrefix = getLogPrefix(requestId);
+    console.warn(`${logPrefix} unauthorized token mismatch`);
+    res.status(401).json({
+      error: "Unauthorized",
+      details: "Missing or invalid extractor API token",
+      requestId,
+    });
+    return false;
+  }
+
+  return true;
 }
 
 function extractPlatform(url) {
@@ -219,6 +289,239 @@ function extractUrlsFromEntry(entry) {
   }
 
   return dedupe(urls);
+}
+
+function extractVideoUrlsFromEntry(entry) {
+  if (!entry || typeof entry !== "object") return [];
+
+  const urls = [];
+
+  if (isHttpUrl(entry.url)) {
+    urls.push(entry.url);
+  }
+
+  const candidates = [];
+  if (Array.isArray(entry.formats)) candidates.push(...entry.formats);
+  if (Array.isArray(entry.requested_formats)) candidates.push(...entry.requested_formats);
+
+  for (const format of candidates) {
+    if (!format || typeof format !== "object") continue;
+
+    const formatUrl = isHttpUrl(format.url) ? format.url : null;
+    if (!formatUrl) continue;
+
+    const vcodec = typeof format.vcodec === "string" ? format.vcodec.toLowerCase() : "";
+    const ext = typeof format.ext === "string" ? format.ext.toLowerCase() : "";
+    const isVideoTrack = vcodec && vcodec !== "none";
+    const looksVideoExt = ext === "mp4" || ext === "mov" || ext === "webm" || ext === "m3u8";
+
+    if (isVideoTrack || looksVideoExt || isLikelyVideoUrl(formatUrl)) {
+      urls.push(formatUrl);
+    }
+  }
+
+  return prioritizeVideoUrls(urls);
+}
+
+async function runYtDlpForVideoStream(url, platform, requestId, sessionId) {
+  const binary = process.env.YT_DLP_PATH || "yt-dlp";
+  const proxy = getProxyUrl(sessionId);
+  const cookiesFile = resolveInstagramCookiesFile();
+  const startedAt = Date.now();
+
+  const args = ["--dump-single-json", "--skip-download", "--no-warnings", "--no-call-home", "--ignore-errors"];
+  if (proxy) args.push("--proxy", proxy);
+  if (cookiesFile && platform === "instagram") args.push("--cookies", cookiesFile);
+
+  const instagramSessionId = process.env.INSTAGRAM_SESSIONID;
+  if (instagramSessionId && platform === "instagram") {
+    args.push("--add-header", `Cookie: sessionid=${instagramSessionId}`);
+  }
+
+  args.push(url);
+
+  console.log(
+    `${getLogPrefix(requestId)} yt-dlp-video start binary=${binary} proxy=${proxy ? "yes" : "no"} cookies=${cookiesFile ? "yes" : "no"} session=${sessionId || "none"}`
+  );
+
+  try {
+    const { stdout } = await execFileAsync(binary, args, {
+      timeout: 120000,
+      maxBuffer: 15 * 1024 * 1024,
+    });
+
+    const payload = parseYtDlpStdout(stdout);
+    const entries = Array.isArray(payload.entries)
+      ? payload.entries.filter((item) => item && typeof item === "object")
+      : [];
+
+    const candidateVideoUrls =
+      entries.length > 0
+        ? prioritizeVideoUrls(entries.flatMap((entry) => extractVideoUrlsFromEntry(entry)))
+        : extractVideoUrlsFromEntry(payload);
+
+    console.log(
+      `${getLogPrefix(requestId)} yt-dlp-video success elapsedMs=${Date.now() - startedAt} candidates=${candidateVideoUrls.length}`
+    );
+
+    return {
+      title: typeof payload.title === "string" ? payload.title : null,
+      description: typeof payload.description === "string" ? payload.description : null,
+      candidateVideoUrls,
+    };
+  } catch (error) {
+    const formatted = formatExecError("yt-dlp-video", error);
+    console.error(
+      `${getLogPrefix(requestId)} yt-dlp-video failed elapsedMs=${Date.now() - startedAt} ${formatted}`
+    );
+    throw new Error(formatted);
+  }
+}
+
+async function runGalleryDlForVideoStream(url, platform, requestId, sessionId) {
+  const binary = process.env.GALLERY_DL_PATH || "gallery-dl";
+  const proxy = getProxyUrl(sessionId);
+  const cookiesFile = resolveInstagramCookiesFile();
+  const startedAt = Date.now();
+
+  const args = [];
+  if (proxy) args.push("--proxy", proxy);
+  if (cookiesFile && platform === "instagram") args.push("--cookies", cookiesFile);
+  args.push("-g", url);
+
+  console.log(
+    `${getLogPrefix(requestId)} gallery-dl-video start binary=${binary} proxy=${proxy ? "yes" : "no"} cookies=${cookiesFile ? "yes" : "no"} session=${sessionId || "none"}`
+  );
+
+  try {
+    const { stdout } = await execFileAsync(binary, args, {
+      timeout: 120000,
+      maxBuffer: 15 * 1024 * 1024,
+    });
+
+    const rawUrls = dedupe(
+      String(stdout)
+        .split("\n")
+        .map((line) => normalizeEscapedUrl(line))
+        .filter((line) => isHttpUrl(line))
+    );
+
+    const candidateVideoUrls = prioritizeVideoUrls(rawUrls);
+
+    console.log(
+      `${getLogPrefix(requestId)} gallery-dl-video success elapsedMs=${Date.now() - startedAt} candidates=${candidateVideoUrls.length}`
+    );
+
+    return {
+      candidateVideoUrls,
+    };
+  } catch (error) {
+    const formatted = formatExecError("gallery-dl-video", error);
+    console.error(
+      `${getLogPrefix(requestId)} gallery-dl-video failed elapsedMs=${Date.now() - startedAt} ${formatted}`
+    );
+    throw new Error(formatted);
+  }
+}
+
+async function probeVideoDuration(videoUrl) {
+  const args = [
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    videoUrl,
+  ];
+
+  try {
+    const { stdout } = await execFileAsync("ffprobe", args, {
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+    });
+
+    const duration = Number.parseFloat(String(stdout || "").trim());
+    if (!Number.isFinite(duration) || duration <= 0) return null;
+    return duration;
+  } catch {
+    return null;
+  }
+}
+
+function buildFrameTimestamps(durationSeconds, frameCount) {
+  if (!durationSeconds || durationSeconds <= 0.8) {
+    const defaults = [0.2, 0.7, 1.2, 1.7, 2.2, 2.7, 3.2, 3.7];
+    return defaults.slice(0, frameCount);
+  }
+
+  const clipLength = Math.max(0.8, durationSeconds - 0.2);
+  const timestamps = [];
+
+  for (let i = 0; i < frameCount; i += 1) {
+    const ratio = frameCount === 1 ? 0.5 : i / (frameCount - 1);
+    const second = Math.max(0.1, Math.min(clipLength, clipLength * ratio));
+    timestamps.push(Number.parseFloat(second.toFixed(2)));
+  }
+
+  return dedupe(timestamps.map((item) => item.toFixed(2))).map((item) => Number.parseFloat(item));
+}
+
+async function extractFramesFromVideoUrl(videoUrl, frameCount, frameWidth, requestId) {
+  const durationSeconds = await probeVideoDuration(videoUrl);
+  const timestamps = buildFrameTimestamps(durationSeconds, frameCount);
+  const frames = [];
+
+  for (let index = 0; index < timestamps.length; index += 1) {
+    const timestamp = timestamps[index];
+    const args = [
+      "-v",
+      "error",
+      "-ss",
+      String(timestamp),
+      "-i",
+      videoUrl,
+      "-frames:v",
+      "1",
+      "-vf",
+      `scale=${frameWidth}:-2`,
+      "-q:v",
+      "4",
+      "-f",
+      "image2pipe",
+      "-vcodec",
+      "mjpeg",
+      "pipe:1",
+    ];
+
+    try {
+      const { stdout } = await execFileAsync("ffmpeg", args, {
+        timeout: 60000,
+        maxBuffer: 8 * 1024 * 1024,
+        encoding: "buffer",
+      });
+
+      if (!stdout || !stdout.length) continue;
+
+      frames.push({
+        index: index + 1,
+        timestamp,
+        mimeType: "image/jpeg",
+        data: stdout.toString("base64"),
+      });
+    } catch (error) {
+      console.warn(
+        `${getLogPrefix(requestId)} frame_extract_failed timestamp=${timestamp} ${formatExecError("ffmpeg", error)}`
+      );
+    }
+  }
+
+  return {
+    durationSeconds,
+    requestedFrameCount: frameCount,
+    extractedFrameCount: frames.length,
+    frames,
+  };
 }
 
 function parseYtDlpStdout(stdout) {
@@ -441,17 +744,7 @@ app.get("/health", (req, res) => {
 app.post("/api/extract-social-post", async (req, res) => {
   const requestId = randomUUID().slice(0, 8);
   const logPrefix = getLogPrefix(requestId);
-  const requiredToken = process.env.SOCIAL_EXTRACTOR_API_TOKEN || process.env.EXTRACTOR_API_TOKEN;
-  const providedToken = getBearerToken(req.headers.authorization);
-
-  if (requiredToken && providedToken !== requiredToken) {
-    console.warn(`${logPrefix} unauthorized token mismatch`);
-    return res.status(401).json({
-      error: "Unauthorized",
-      details: "Missing or invalid extractor API token",
-      requestId,
-    });
-  }
+  if (!authorizeRequest(req, res, requestId)) return;
 
   const { url, platform, sessionId } = req.body || {};
   if (typeof url !== "string" || !url.trim()) {
@@ -524,11 +817,168 @@ app.post("/api/extract-social-post", async (req, res) => {
   });
 });
 
+app.post("/api/extract-video-frames", async (req, res) => {
+  const requestId = randomUUID().slice(0, 8);
+  const logPrefix = getLogPrefix(requestId);
+  if (!authorizeRequest(req, res, requestId)) return;
+
+  const { url, platform, sessionId, frameCount, frameWidth } = req.body || {};
+
+  if (typeof url !== "string" || !url.trim()) {
+    console.warn(`${logPrefix} validation_failed missing url`);
+    return res.status(400).json({ error: "url is required", requestId });
+  }
+
+  const resolvedPlatform =
+    typeof platform === "string" && platform.trim() ? platform.trim().toLowerCase() : extractPlatform(url);
+
+  if (resolvedPlatform !== "instagram" && resolvedPlatform !== "tiktok") {
+    console.warn(`${logPrefix} unsupported_platform resolved=${resolvedPlatform}`);
+    return res.status(400).json({
+      error: "Unsupported platform for video frame endpoint",
+      details: `resolved platform: ${resolvedPlatform}`,
+      requestId,
+    });
+  }
+
+  const safeSessionId = typeof sessionId === "string" && sessionId.trim() ? sessionId : undefined;
+  const extractionUrl =
+    resolvedPlatform === "tiktok"
+      ? await resolveTikTokUrl(url, requestId, safeSessionId)
+      : String(url).trim();
+
+  const normalizedFrameCount = toBoundedInteger(
+    frameCount,
+    DEFAULT_FRAME_COUNT,
+    MIN_FRAME_COUNT,
+    MAX_FRAME_COUNT
+  );
+  const normalizedFrameWidth = toBoundedInteger(
+    frameWidth,
+    DEFAULT_FRAME_WIDTH,
+    MIN_FRAME_WIDTH,
+    MAX_FRAME_WIDTH
+  );
+
+  console.log(
+    `${logPrefix} frame_extract_start platform=${resolvedPlatform} session=${safeSessionId || "none"} frameCount=${normalizedFrameCount} frameWidth=${normalizedFrameWidth} url=${extractionUrl}`
+  );
+
+  const errors = [];
+  let videoUrl = null;
+  let sourceExtractor = null;
+  let title = null;
+  let description = null;
+
+  try {
+    const ytResult = await runYtDlpForVideoStream(
+      extractionUrl,
+      resolvedPlatform,
+      requestId,
+      safeSessionId
+    );
+
+    if (ytResult.candidateVideoUrls.length > 0) {
+      videoUrl = ytResult.candidateVideoUrls[0];
+      title = ytResult.title;
+      description = ytResult.description;
+      sourceExtractor = "yt-dlp";
+    } else {
+      errors.push("yt-dlp returned no candidate video stream URLs");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "yt-dlp video extraction failed";
+    errors.push(`yt-dlp-video: ${message}`);
+    console.error(`${logPrefix} yt-dlp-video error message=${message}`);
+  }
+
+  if (!videoUrl) {
+    try {
+      const galleryResult = await runGalleryDlForVideoStream(
+        extractionUrl,
+        resolvedPlatform,
+        requestId,
+        safeSessionId
+      );
+
+      if (galleryResult.candidateVideoUrls.length > 0) {
+        videoUrl = galleryResult.candidateVideoUrls[0];
+        sourceExtractor = "gallery-dl";
+      } else {
+        errors.push("gallery-dl returned no candidate video stream URLs");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "gallery-dl video extraction failed";
+      errors.push(`gallery-dl-video: ${message}`);
+      console.error(`${logPrefix} gallery-dl-video error message=${message}`);
+    }
+  }
+
+  if (!videoUrl) {
+    console.error(`${logPrefix} frame_extract_failed no_video_url errors=${errors.length}`);
+    return res.status(422).json({
+      error: "Failed to resolve a direct video stream URL",
+      details: errors,
+      requestId,
+    });
+  }
+
+  try {
+    const frameResult = await extractFramesFromVideoUrl(
+      videoUrl,
+      normalizedFrameCount,
+      normalizedFrameWidth,
+      requestId
+    );
+
+    if (frameResult.extractedFrameCount === 0) {
+      console.error(`${logPrefix} frame_extract_failed zero_frames`);
+      return res.status(422).json({
+        error: "Failed to extract frames from resolved video URL",
+        details: [
+          ...errors,
+          "ffmpeg produced zero frames from the resolved stream URL",
+        ],
+        requestId,
+      });
+    }
+
+    console.log(
+      `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${frameResult.extractedFrameCount}/${frameResult.requestedFrameCount}`
+    );
+
+    return res.json({
+      requestId,
+      extractor: sourceExtractor,
+      platform: resolvedPlatform,
+      sourceUrl: extractionUrl,
+      videoUrl,
+      title,
+      description,
+      durationSeconds: frameResult.durationSeconds,
+      requestedFrameCount: frameResult.requestedFrameCount,
+      extractedFrameCount: frameResult.extractedFrameCount,
+      frameWidth: normalizedFrameWidth,
+      frames: frameResult.frames,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown frame extraction error";
+    console.error(`${logPrefix} frame_extract_failed message=${message}`);
+    return res.status(422).json({
+      error: "Frame extraction failed",
+      details: [...errors, message],
+      requestId,
+    });
+  }
+});
+
 async function logRuntimeDiagnostics() {
   const checks = [
     { label: "yt-dlp", cmd: process.env.YT_DLP_PATH || "yt-dlp", args: ["--version"] },
     { label: "gallery-dl", cmd: process.env.GALLERY_DL_PATH || "gallery-dl", args: ["--version"] },
     { label: "python3", cmd: "python3", args: ["--version"] },
+    { label: "ffmpeg", cmd: "ffmpeg", args: ["-version"] },
+    { label: "ffprobe", cmd: "ffprobe", args: ["-version"] },
   ];
 
   console.log(
