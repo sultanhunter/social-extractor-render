@@ -109,7 +109,7 @@ function isLikelyVideoUrl(url) {
 
   const lower = String(url).toLowerCase();
 
-  if (lower.includes("mime_type=audio") || lower.includes("/audio/")) {
+  if (isLikelyAudioOnlyUrl(lower)) {
     return false;
   }
 
@@ -120,6 +120,30 @@ function isLikelyVideoUrl(url) {
     lower.includes("/play/") ||
     lower.includes("/aweme/v1/play")
   );
+}
+
+function isLikelyAudioOnlyUrl(url) {
+  const lower = String(url).toLowerCase();
+
+  if (lower.includes("mime_type=audio") || lower.includes("/audio/")) {
+    return true;
+  }
+
+  const hasAudioMarker =
+    lower.includes("_audio") ||
+    lower.includes("audio_") ||
+    lower.includes("heaac") ||
+    lower.includes("aac") ||
+    lower.includes("opus");
+
+  const hasVideoMarker =
+    lower.includes("mime_type=video") ||
+    lower.includes("_video") ||
+    lower.includes("video_") ||
+    lower.includes("vcodec") ||
+    lower.includes("/video/");
+
+  return hasAudioMarker && !hasVideoMarker;
 }
 
 function scoreVideoUrl(url) {
@@ -296,7 +320,17 @@ function extractVideoUrlsFromEntry(entry) {
 
   const urls = [];
 
-  if (isHttpUrl(entry.url)) {
+  const entryVcodec = typeof entry.vcodec === "string" ? entry.vcodec.toLowerCase() : "";
+  const entryExt = typeof entry.ext === "string" ? entry.ext.toLowerCase() : "";
+  const entryIsVideoTrack = entryVcodec && entryVcodec !== "none";
+  const entryLooksVideoExt =
+    entryExt === "mp4" || entryExt === "mov" || entryExt === "webm" || entryExt === "m3u8";
+
+  if (
+    isHttpUrl(entry.url) &&
+    !isLikelyAudioOnlyUrl(entry.url) &&
+    (entryIsVideoTrack || entryLooksVideoExt || isLikelyVideoUrl(entry.url))
+  ) {
     urls.push(entry.url);
   }
 
@@ -315,7 +349,7 @@ function extractVideoUrlsFromEntry(entry) {
     const isVideoTrack = vcodec && vcodec !== "none";
     const looksVideoExt = ext === "mp4" || ext === "mov" || ext === "webm" || ext === "m3u8";
 
-    if (isVideoTrack || looksVideoExt || isLikelyVideoUrl(formatUrl)) {
+    if (!isLikelyAudioOnlyUrl(formatUrl) && (isVideoTrack || looksVideoExt || isLikelyVideoUrl(formatUrl))) {
       urls.push(formatUrl);
     }
   }
@@ -449,6 +483,31 @@ async function probeVideoDuration(videoUrl) {
   }
 }
 
+async function hasVideoStream(videoUrl) {
+  const args = [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=codec_type",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
+    videoUrl,
+  ];
+
+  try {
+    const { stdout } = await execFileAsync("ffprobe", args, {
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+    });
+
+    return String(stdout || "").toLowerCase().includes("video");
+  } catch {
+    return false;
+  }
+}
+
 function buildFrameTimestamps(durationSeconds, frameCount) {
   if (!durationSeconds || durationSeconds <= 0.8) {
     const defaults = [0.2, 0.7, 1.2, 1.7, 2.2, 2.7, 3.2, 3.7];
@@ -468,6 +527,11 @@ function buildFrameTimestamps(durationSeconds, frameCount) {
 }
 
 async function extractFramesFromVideoUrl(videoUrl, frameCount, frameWidth, requestId) {
+  const hasVideo = await hasVideoStream(videoUrl);
+  if (!hasVideo) {
+    throw new Error("resolved stream has no video track");
+  }
+
   const durationSeconds = await probeVideoDuration(videoUrl);
   const timestamps = buildFrameTimestamps(durationSeconds, frameCount);
   const frames = [];
@@ -521,6 +585,47 @@ async function extractFramesFromVideoUrl(videoUrl, frameCount, frameWidth, reque
     requestedFrameCount: frameCount,
     extractedFrameCount: frames.length,
     frames,
+  };
+}
+
+async function extractFramesFromCandidates(candidateUrls, frameCount, frameWidth, requestId) {
+  const errors = [];
+
+  for (const candidateUrl of candidateUrls) {
+    if (!isHttpUrl(candidateUrl)) continue;
+    if (isLikelyAudioOnlyUrl(candidateUrl)) {
+      errors.push(`skip audio-only candidate: ${truncate(candidateUrl, 120)}`);
+      continue;
+    }
+
+    try {
+      const frameResult = await extractFramesFromVideoUrl(
+        candidateUrl,
+        frameCount,
+        frameWidth,
+        requestId
+      );
+
+      if (frameResult.extractedFrameCount > 0) {
+        return {
+          videoUrl: candidateUrl,
+          frameResult,
+          errors,
+        };
+      }
+
+      errors.push(`candidate produced zero frames: ${truncate(candidateUrl, 120)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown candidate extraction error";
+      errors.push(`candidate failed: ${truncate(candidateUrl, 120)} | ${message}`);
+      console.warn(`${getLogPrefix(requestId)} candidate_failed url=${truncate(candidateUrl, 180)} message=${message}`);
+    }
+  }
+
+  return {
+    videoUrl: null,
+    frameResult: null,
+    errors,
   };
 }
 
@@ -865,10 +970,11 @@ app.post("/api/extract-video-frames", async (req, res) => {
   );
 
   const errors = [];
-  let videoUrl = null;
-  let sourceExtractor = null;
   let title = null;
   let description = null;
+  let sourceExtractor = null;
+  const ytCandidateUrls = [];
+  const galleryCandidateUrls = [];
 
   try {
     const ytResult = await runYtDlpForVideoStream(
@@ -879,10 +985,9 @@ app.post("/api/extract-video-frames", async (req, res) => {
     );
 
     if (ytResult.candidateVideoUrls.length > 0) {
-      videoUrl = ytResult.candidateVideoUrls[0];
+      ytCandidateUrls.push(...ytResult.candidateVideoUrls);
       title = ytResult.title;
       description = ytResult.description;
-      sourceExtractor = "yt-dlp";
     } else {
       errors.push("yt-dlp returned no candidate video stream URLs");
     }
@@ -892,84 +997,99 @@ app.post("/api/extract-video-frames", async (req, res) => {
     console.error(`${logPrefix} yt-dlp-video error message=${message}`);
   }
 
-  if (!videoUrl) {
-    try {
-      const galleryResult = await runGalleryDlForVideoStream(
-        extractionUrl,
-        resolvedPlatform,
-        requestId,
-        safeSessionId
-      );
-
-      if (galleryResult.candidateVideoUrls.length > 0) {
-        videoUrl = galleryResult.candidateVideoUrls[0];
-        sourceExtractor = "gallery-dl";
-      } else {
-        errors.push("gallery-dl returned no candidate video stream URLs");
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "gallery-dl video extraction failed";
-      errors.push(`gallery-dl-video: ${message}`);
-      console.error(`${logPrefix} gallery-dl-video error message=${message}`);
-    }
-  }
-
-  if (!videoUrl) {
-    console.error(`${logPrefix} frame_extract_failed no_video_url errors=${errors.length}`);
-    return res.status(422).json({
-      error: "Failed to resolve a direct video stream URL",
-      details: errors,
-      requestId,
-    });
-  }
-
-  try {
-    const frameResult = await extractFramesFromVideoUrl(
-      videoUrl,
+  if (ytCandidateUrls.length > 0) {
+    const ytAttempt = await extractFramesFromCandidates(
+      ytCandidateUrls,
       normalizedFrameCount,
       normalizedFrameWidth,
       requestId
     );
 
-    if (frameResult.extractedFrameCount === 0) {
-      console.error(`${logPrefix} frame_extract_failed zero_frames`);
-      return res.status(422).json({
-        error: "Failed to extract frames from resolved video URL",
-        details: [
-          ...errors,
-          "ffmpeg produced zero frames from the resolved stream URL",
-        ],
+    errors.push(...ytAttempt.errors.map((item) => `yt-dlp-video: ${item}`));
+
+    if (ytAttempt.videoUrl && ytAttempt.frameResult) {
+      sourceExtractor = "yt-dlp";
+
+      console.log(
+        `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${ytAttempt.frameResult.extractedFrameCount}/${ytAttempt.frameResult.requestedFrameCount}`
+      );
+
+      return res.json({
         requestId,
+        extractor: sourceExtractor,
+        platform: resolvedPlatform,
+        sourceUrl: extractionUrl,
+        videoUrl: ytAttempt.videoUrl,
+        title,
+        description,
+        durationSeconds: ytAttempt.frameResult.durationSeconds,
+        requestedFrameCount: ytAttempt.frameResult.requestedFrameCount,
+        extractedFrameCount: ytAttempt.frameResult.extractedFrameCount,
+        frameWidth: normalizedFrameWidth,
+        frames: ytAttempt.frameResult.frames,
       });
     }
+  }
 
-    console.log(
-      `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${frameResult.extractedFrameCount}/${frameResult.requestedFrameCount}`
+  try {
+    const galleryResult = await runGalleryDlForVideoStream(
+      extractionUrl,
+      resolvedPlatform,
+      requestId,
+      safeSessionId
     );
 
-    return res.json({
-      requestId,
-      extractor: sourceExtractor,
-      platform: resolvedPlatform,
-      sourceUrl: extractionUrl,
-      videoUrl,
-      title,
-      description,
-      durationSeconds: frameResult.durationSeconds,
-      requestedFrameCount: frameResult.requestedFrameCount,
-      extractedFrameCount: frameResult.extractedFrameCount,
-      frameWidth: normalizedFrameWidth,
-      frames: frameResult.frames,
-    });
+    if (galleryResult.candidateVideoUrls.length > 0) {
+      galleryCandidateUrls.push(...galleryResult.candidateVideoUrls);
+    } else {
+      errors.push("gallery-dl returned no candidate video stream URLs");
+    }
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown frame extraction error";
-    console.error(`${logPrefix} frame_extract_failed message=${message}`);
-    return res.status(422).json({
-      error: "Frame extraction failed",
-      details: [...errors, message],
-      requestId,
-    });
+    const message = error instanceof Error ? error.message : "gallery-dl video extraction failed";
+    errors.push(`gallery-dl-video: ${message}`);
+    console.error(`${logPrefix} gallery-dl-video error message=${message}`);
   }
+
+  if (galleryCandidateUrls.length > 0) {
+    const galleryAttempt = await extractFramesFromCandidates(
+      galleryCandidateUrls,
+      normalizedFrameCount,
+      normalizedFrameWidth,
+      requestId
+    );
+
+    errors.push(...galleryAttempt.errors.map((item) => `gallery-dl-video: ${item}`));
+
+    if (galleryAttempt.videoUrl && galleryAttempt.frameResult) {
+      sourceExtractor = "gallery-dl";
+
+      console.log(
+        `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${galleryAttempt.frameResult.extractedFrameCount}/${galleryAttempt.frameResult.requestedFrameCount}`
+      );
+
+      return res.json({
+        requestId,
+        extractor: sourceExtractor,
+        platform: resolvedPlatform,
+        sourceUrl: extractionUrl,
+        videoUrl: galleryAttempt.videoUrl,
+        title,
+        description,
+        durationSeconds: galleryAttempt.frameResult.durationSeconds,
+        requestedFrameCount: galleryAttempt.frameResult.requestedFrameCount,
+        extractedFrameCount: galleryAttempt.frameResult.extractedFrameCount,
+        frameWidth: normalizedFrameWidth,
+        frames: galleryAttempt.frameResult.frames,
+      });
+    }
+  }
+
+  console.error(`${logPrefix} frame_extract_failed no_working_video_stream errors=${errors.length}`);
+  return res.status(422).json({
+    error: "Frame extraction failed",
+    details: errors,
+    requestId,
+  });
 });
 
 async function logRuntimeDiagnostics() {
