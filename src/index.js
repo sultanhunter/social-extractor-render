@@ -1,7 +1,8 @@
 const { execFile } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
-const { existsSync, writeFileSync } = require("node:fs");
-const { resolve } = require("node:path");
+const { existsSync, writeFileSync, mkdtempSync, rmSync } = require("node:fs");
+const { resolve, join } = require("node:path");
+const { tmpdir } = require("node:os");
 const { promisify } = require("node:util");
 
 const cors = require("cors");
@@ -422,6 +423,79 @@ async function runYtDlpForVideoStream(url, platform, requestId, sessionId) {
     console.error(
       `${getLogPrefix(requestId)} yt-dlp-video failed elapsedMs=${Date.now() - startedAt} ${formatted}`
     );
+    throw new Error(formatted);
+  }
+}
+
+function safeRemovePath(pathToRemove) {
+  if (!pathToRemove || typeof pathToRemove !== "string") return;
+  try {
+    rmSync(pathToRemove, { recursive: true, force: true });
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+async function downloadVideoViaYtDlp(url, platform, requestId, sessionId) {
+  const binary = process.env.YT_DLP_PATH || "yt-dlp";
+  const proxy = getProxyUrl(sessionId);
+  const cookiesFile = resolveInstagramCookiesFile();
+  const tempDir = mkdtempSync(join(tmpdir(), "social-extract-video-"));
+  const outputTemplate = join(tempDir, "clip.%(ext)s");
+
+  const args = [
+    "--no-warnings",
+    "--no-call-home",
+    "--ignore-errors",
+    "--no-playlist",
+    "--merge-output-format",
+    "mp4",
+    "-f",
+    "bv*+ba/b",
+    "-o",
+    outputTemplate,
+    "--print",
+    "after_move:filepath",
+  ];
+
+  if (proxy) args.push("--proxy", proxy);
+  if (cookiesFile && platform === "instagram") args.push("--cookies", cookiesFile);
+  args.push(url);
+
+  console.log(
+    `${getLogPrefix(requestId)} yt-dlp-download start binary=${binary} proxy=${proxy ? "yes" : "no"} cookies=${cookiesFile ? "yes" : "no"}`
+  );
+
+  try {
+    const { stdout } = await execFileAsync(binary, args, {
+      timeout: 240000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+
+    const printedPaths = String(stdout || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const downloadedPath = printedPaths.find((candidate) => existsSync(candidate));
+
+    if (!downloadedPath) {
+      throw new Error("yt-dlp download completed without a local output file");
+    }
+
+    console.log(
+      `${getLogPrefix(requestId)} yt-dlp-download success file=${truncate(downloadedPath, 180)}`
+    );
+
+    return {
+      tempDir,
+      filePath: downloadedPath,
+      cleanup: () => safeRemovePath(tempDir),
+    };
+  } catch (error) {
+    safeRemovePath(tempDir);
+    const formatted = formatExecError("yt-dlp-download", error);
+    console.error(`${getLogPrefix(requestId)} yt-dlp-download failed ${formatted}`);
     throw new Error(formatted);
   }
 }
@@ -1316,6 +1390,63 @@ app.post("/api/extract-video-frames", async (req, res) => {
         transcript,
       });
     }
+  }
+
+  try {
+    const downloaded = await downloadVideoViaYtDlp(
+      extractionUrl,
+      resolvedPlatform,
+      requestId,
+      safeSessionId
+    );
+
+    try {
+      const localAttempt = await extractFramesFromVideoUrl(
+        downloaded.filePath,
+        normalizedFrameCount,
+        normalizedFrameWidth,
+        requestId
+      );
+
+      if (localAttempt.extractedFrameCount > 0) {
+        sourceExtractor = "yt-dlp-local-download";
+
+        console.log(
+          `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${localAttempt.extractedFrameCount}/${localAttempt.requestedFrameCount}`
+        );
+
+        const transcript = shouldIncludeTranscript
+          ? await buildVideoTranscript(downloaded.filePath, requestId, normalizedTranscriptMaxSeconds)
+          : {
+              available: false,
+              error: "transcript disabled by request",
+            };
+
+        return res.json({
+          requestId,
+          extractor: sourceExtractor,
+          platform: resolvedPlatform,
+          sourceUrl: extractionUrl,
+          videoUrl: extractionUrl,
+          title,
+          description,
+          durationSeconds: localAttempt.durationSeconds,
+          requestedFrameCount: localAttempt.requestedFrameCount,
+          extractedFrameCount: localAttempt.extractedFrameCount,
+          frameWidth: normalizedFrameWidth,
+          frames: localAttempt.frames,
+          transcript,
+        });
+      }
+
+      errors.push("yt-dlp local download fallback produced zero frames");
+    } finally {
+      downloaded.cleanup();
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "yt-dlp local download fallback failed";
+    errors.push(`yt-dlp-download: ${message}`);
+    console.error(`${logPrefix} yt-dlp-download error message=${message}`);
   }
 
   console.error(`${logPrefix} frame_extract_failed no_working_video_stream errors=${errors.length}`);
