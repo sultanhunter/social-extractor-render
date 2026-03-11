@@ -21,6 +21,10 @@ const MAX_FRAME_COUNT = 12;
 const DEFAULT_FRAME_WIDTH = 960;
 const MIN_FRAME_WIDTH = 480;
 const MAX_FRAME_WIDTH = 1440;
+const DEFAULT_TRANSCRIPT_ENABLED = true;
+const DEFAULT_TRANSCRIPT_MAX_SECONDS = 90;
+const MIN_TRANSCRIPT_MAX_SECONDS = 20;
+const MAX_TRANSCRIPT_MAX_SECONDS = 180;
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -171,6 +175,16 @@ function toBoundedInteger(value, fallback, min, max) {
   if (parsed < min) return min;
   if (parsed > max) return max;
   return parsed;
+}
+
+function toBoolean(value, fallback) {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return fallback;
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  return fallback;
 }
 
 function normalizeAndFilterMediaUrls(urls, platform) {
@@ -629,6 +643,203 @@ async function extractFramesFromCandidates(candidateUrls, frameCount, frameWidth
   };
 }
 
+function parseJsonObject(text) {
+  if (typeof text !== "string") return null;
+
+  const cleaned = text
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```/i, "")
+    .replace(/```$/i, "")
+    .trim();
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      const parsed = JSON.parse(match[0]);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+async function extractAudioBufferForTranscript(videoUrl, maxSeconds) {
+  const args = [
+    "-v",
+    "error",
+    "-i",
+    videoUrl,
+    "-vn",
+    "-ac",
+    "1",
+    "-ar",
+    "16000",
+    "-t",
+    String(maxSeconds),
+    "-f",
+    "mp3",
+    "-b:a",
+    "64k",
+    "pipe:1",
+  ];
+
+  const { stdout } = await execFileAsync("ffmpeg", args, {
+    timeout: 90000,
+    maxBuffer: 20 * 1024 * 1024,
+    encoding: "buffer",
+  });
+
+  return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout || "");
+}
+
+async function transcribeAudioWithGemini(audioBuffer, requestId) {
+  const apiKey =
+    process.env.GOOGLE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("Missing GEMINI API key for transcript extraction on extractor service.");
+  }
+
+  const model = process.env.GEMINI_TRANSCRIBE_MODEL || "gemini-3.1-flash-lite-preview";
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const prompt = `Transcribe this short-form social video audio.
+
+Rules:
+- Return strict JSON only.
+- Preserve original language.
+- Keep punctuation natural.
+- If speech is unclear, still provide best-effort text.
+
+JSON shape:
+{
+  "language": "string",
+  "summary": "1-2 sentence summary",
+  "fullText": "full transcript text",
+  "segments": [
+    { "startSec": 0.0, "endSec": 2.4, "text": "..." }
+  ]
+}`;
+
+  const payload = {
+    contents: [
+      {
+        parts: [
+          { text: prompt },
+          {
+            inlineData: {
+              mimeType: "audio/mpeg",
+              data: audioBuffer.toString("base64"),
+            },
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.1,
+      responseMimeType: "application/json",
+    },
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const raw = await response.text();
+    throw new Error(`Gemini transcript request failed (${response.status}): ${truncate(toSingleLine(raw), 300)}`);
+  }
+
+  const data = await response.json();
+  const candidateText =
+    data?.candidates?.[0]?.content?.parts
+      ?.map((part) => (typeof part?.text === "string" ? part.text : ""))
+      .filter(Boolean)
+      .join("\n") || "";
+
+  const parsed = parseJsonObject(candidateText);
+  if (!parsed) {
+    throw new Error("Gemini transcript response was not valid JSON");
+  }
+
+  const segmentsRaw = Array.isArray(parsed.segments) ? parsed.segments : [];
+  const segments = segmentsRaw
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const row = item;
+      const text = typeof row.text === "string" ? row.text.trim() : "";
+      if (!text) return null;
+
+      return {
+        startSec: typeof row.startSec === "number" ? row.startSec : 0,
+        endSec: typeof row.endSec === "number" ? row.endSec : 0,
+        text,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 80);
+
+  const fullText =
+    typeof parsed.fullText === "string" && parsed.fullText.trim()
+      ? parsed.fullText.trim()
+      : segments.map((item) => item.text).join(" ").trim();
+
+  return {
+    provider: "gemini",
+    model,
+    language: typeof parsed.language === "string" ? parsed.language.trim() : "unknown",
+    summary: typeof parsed.summary === "string" ? parsed.summary.trim() : "",
+    fullText,
+    segments,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+async function buildVideoTranscript(videoUrl, requestId, maxSeconds) {
+  try {
+    const audioBuffer = await extractAudioBufferForTranscript(videoUrl, maxSeconds);
+
+    if (!audioBuffer || audioBuffer.length < 1024) {
+      return {
+        available: false,
+        error: "audio extraction produced an empty payload",
+      };
+    }
+
+    const transcript = await transcribeAudioWithGemini(audioBuffer, requestId);
+
+    if (!transcript.fullText) {
+      return {
+        available: false,
+        error: "transcript extraction returned empty text",
+      };
+    }
+
+    return {
+      available: true,
+      ...transcript,
+      maxSeconds,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown transcript extraction error";
+    console.warn(`${getLogPrefix(requestId)} transcript_failed message=${message}`);
+
+    return {
+      available: false,
+      error: message,
+    };
+  }
+}
+
 function parseYtDlpStdout(stdout) {
   const trimmed = String(stdout || "").trim();
   if (!trimmed) throw new Error("yt-dlp returned empty output");
@@ -927,7 +1138,7 @@ app.post("/api/extract-video-frames", async (req, res) => {
   const logPrefix = getLogPrefix(requestId);
   if (!authorizeRequest(req, res, requestId)) return;
 
-  const { url, platform, sessionId, frameCount, frameWidth } = req.body || {};
+  const { url, platform, sessionId, frameCount, frameWidth, includeTranscript, transcriptMaxSeconds } = req.body || {};
 
   if (typeof url !== "string" || !url.trim()) {
     console.warn(`${logPrefix} validation_failed missing url`);
@@ -963,6 +1174,13 @@ app.post("/api/extract-video-frames", async (req, res) => {
     DEFAULT_FRAME_WIDTH,
     MIN_FRAME_WIDTH,
     MAX_FRAME_WIDTH
+  );
+  const shouldIncludeTranscript = toBoolean(includeTranscript, DEFAULT_TRANSCRIPT_ENABLED);
+  const normalizedTranscriptMaxSeconds = toBoundedInteger(
+    transcriptMaxSeconds,
+    DEFAULT_TRANSCRIPT_MAX_SECONDS,
+    MIN_TRANSCRIPT_MAX_SECONDS,
+    MAX_TRANSCRIPT_MAX_SECONDS
   );
 
   console.log(
@@ -1014,6 +1232,13 @@ app.post("/api/extract-video-frames", async (req, res) => {
         `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${ytAttempt.frameResult.extractedFrameCount}/${ytAttempt.frameResult.requestedFrameCount}`
       );
 
+      const transcript = shouldIncludeTranscript
+        ? await buildVideoTranscript(ytAttempt.videoUrl, requestId, normalizedTranscriptMaxSeconds)
+        : {
+            available: false,
+            error: "transcript disabled by request",
+          };
+
       return res.json({
         requestId,
         extractor: sourceExtractor,
@@ -1027,6 +1252,7 @@ app.post("/api/extract-video-frames", async (req, res) => {
         extractedFrameCount: ytAttempt.frameResult.extractedFrameCount,
         frameWidth: normalizedFrameWidth,
         frames: ytAttempt.frameResult.frames,
+        transcript,
       });
     }
   }
@@ -1067,6 +1293,13 @@ app.post("/api/extract-video-frames", async (req, res) => {
         `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${galleryAttempt.frameResult.extractedFrameCount}/${galleryAttempt.frameResult.requestedFrameCount}`
       );
 
+      const transcript = shouldIncludeTranscript
+        ? await buildVideoTranscript(galleryAttempt.videoUrl, requestId, normalizedTranscriptMaxSeconds)
+        : {
+            available: false,
+            error: "transcript disabled by request",
+          };
+
       return res.json({
         requestId,
         extractor: sourceExtractor,
@@ -1080,6 +1313,7 @@ app.post("/api/extract-video-frames", async (req, res) => {
         extractedFrameCount: galleryAttempt.frameResult.extractedFrameCount,
         frameWidth: normalizedFrameWidth,
         frames: galleryAttempt.frameResult.frames,
+        transcript,
       });
     }
   }
