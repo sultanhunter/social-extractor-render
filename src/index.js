@@ -1,13 +1,14 @@
 const { execFile } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
-const { existsSync, writeFileSync, mkdtempSync, rmSync } = require("node:fs");
-const { resolve, join } = require("node:path");
+const { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } = require("node:fs");
+const { resolve, join, extname } = require("node:path");
 const { tmpdir } = require("node:os");
 const { promisify } = require("node:util");
 
 const cors = require("cors");
 const dotenv = require("dotenv");
 const express = require("express");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 dotenv.config();
 
@@ -15,6 +16,83 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 let generatedCookiesPath = null;
+
+// ── R2 (optional) ──────────────────────────────────────────────────────
+const R2_ACCOUNT_ID = process.env.CLOUDFLARE_R2_ACCOUNT_ID || "";
+const R2_ACCESS_KEY_ID = process.env.CLOUDFLARE_R2_ACCESS_KEY_ID || "";
+const R2_SECRET_ACCESS_KEY = process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY || "";
+const R2_BUCKET_NAME = process.env.CLOUDFLARE_R2_BUCKET_NAME || "";
+const R2_PUBLIC_URL = (process.env.CLOUDFLARE_R2_PUBLIC_URL || "").replace(/\/+$/, "");
+
+const r2Configured = Boolean(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET_NAME && R2_PUBLIC_URL);
+
+const r2Client = r2Configured
+  ? new S3Client({
+      region: "auto",
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+    })
+  : null;
+
+function encodeR2KeyForPublicUrl(key) {
+  return key.split("/").filter(Boolean).map(encodeURIComponent).join("/");
+}
+
+/**
+ * Upload a local video file to R2.
+ * Returns the public URL or null if R2 is not configured / upload fails.
+ */
+async function uploadVideoFileToR2(filePath, collectionId, requestId) {
+  if (!r2Client || !r2Configured || !collectionId) return null;
+
+  const logPrefix = getLogPrefix(requestId);
+  const startedAt = Date.now();
+  const ext = extname(filePath).toLowerCase() || ".mp4";
+  const key = `collections/${collectionId}/videos/${randomUUID()}${ext}`;
+
+  try {
+    const body = readFileSync(filePath);
+    const contentType = ext === ".webm" ? "video/webm" : ext === ".mov" ? "video/quicktime" : "video/mp4";
+
+    await r2Client.send(
+      new PutObjectCommand({
+        Bucket: R2_BUCKET_NAME,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      })
+    );
+
+    const publicUrl = `${R2_PUBLIC_URL}/${encodeR2KeyForPublicUrl(key)}`;
+    console.log(`${logPrefix} r2_upload_success key=${key} size=${body.length} elapsedMs=${Date.now() - startedAt}`);
+    return publicUrl;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown R2 upload error";
+    console.error(`${logPrefix} r2_upload_failed key=${key} elapsedMs=${Date.now() - startedAt} error=${message}`);
+    return null;
+  }
+}
+
+/**
+ * Download a video from a CDN URL via yt-dlp, upload to R2, clean up.
+ * Returns the public R2 URL or null.
+ */
+async function downloadAndUploadToR2(sourceUrl, platform, collectionId, requestId, sessionId) {
+  if (!r2Client || !r2Configured || !collectionId) return null;
+
+  let downloaded = null;
+  try {
+    downloaded = await downloadVideoViaYtDlp(sourceUrl, platform, requestId, sessionId);
+    const r2Url = await uploadVideoFileToR2(downloaded.filePath, collectionId, requestId);
+    return r2Url;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown download+upload error";
+    console.warn(`${getLogPrefix(requestId)} r2_download_upload_failed error=${message}`);
+    return null;
+  } finally {
+    if (downloaded) downloaded.cleanup();
+  }
+}
 
 const DEFAULT_FRAME_COUNT = 6;
 const MIN_FRAME_COUNT = 2;
@@ -1212,7 +1290,7 @@ app.post("/api/extract-video-frames", async (req, res) => {
   const logPrefix = getLogPrefix(requestId);
   if (!authorizeRequest(req, res, requestId)) return;
 
-  const { url, platform, sessionId, frameCount, frameWidth, includeTranscript, transcriptMaxSeconds } = req.body || {};
+  const { url, platform, sessionId, frameCount, frameWidth, includeTranscript, transcriptMaxSeconds, collectionId } = req.body || {};
 
   if (typeof url !== "string" || !url.trim()) {
     console.warn(`${logPrefix} validation_failed missing url`);
@@ -1306,12 +1384,12 @@ app.post("/api/extract-video-frames", async (req, res) => {
         `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${ytAttempt.frameResult.extractedFrameCount}/${ytAttempt.frameResult.requestedFrameCount}`
       );
 
-      const transcript = shouldIncludeTranscript
-        ? await buildVideoTranscript(ytAttempt.videoUrl, requestId, normalizedTranscriptMaxSeconds)
-        : {
-            available: false,
-            error: "transcript disabled by request",
-          };
+      const [transcript, r2VideoUrl] = await Promise.all([
+        shouldIncludeTranscript
+          ? buildVideoTranscript(ytAttempt.videoUrl, requestId, normalizedTranscriptMaxSeconds)
+          : Promise.resolve({ available: false, error: "transcript disabled by request" }),
+        downloadAndUploadToR2(extractionUrl, resolvedPlatform, collectionId, requestId, safeSessionId),
+      ]);
 
       return res.json({
         requestId,
@@ -1319,6 +1397,7 @@ app.post("/api/extract-video-frames", async (req, res) => {
         platform: resolvedPlatform,
         sourceUrl: extractionUrl,
         videoUrl: ytAttempt.videoUrl,
+        r2VideoUrl: r2VideoUrl || null,
         title,
         description,
         durationSeconds: ytAttempt.frameResult.durationSeconds,
@@ -1367,12 +1446,12 @@ app.post("/api/extract-video-frames", async (req, res) => {
         `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${galleryAttempt.frameResult.extractedFrameCount}/${galleryAttempt.frameResult.requestedFrameCount}`
       );
 
-      const transcript = shouldIncludeTranscript
-        ? await buildVideoTranscript(galleryAttempt.videoUrl, requestId, normalizedTranscriptMaxSeconds)
-        : {
-            available: false,
-            error: "transcript disabled by request",
-          };
+      const [transcript, r2VideoUrl] = await Promise.all([
+        shouldIncludeTranscript
+          ? buildVideoTranscript(galleryAttempt.videoUrl, requestId, normalizedTranscriptMaxSeconds)
+          : Promise.resolve({ available: false, error: "transcript disabled by request" }),
+        downloadAndUploadToR2(extractionUrl, resolvedPlatform, collectionId, requestId, safeSessionId),
+      ]);
 
       return res.json({
         requestId,
@@ -1380,6 +1459,7 @@ app.post("/api/extract-video-frames", async (req, res) => {
         platform: resolvedPlatform,
         sourceUrl: extractionUrl,
         videoUrl: galleryAttempt.videoUrl,
+        r2VideoUrl: r2VideoUrl || null,
         title,
         description,
         durationSeconds: galleryAttempt.frameResult.durationSeconds,
@@ -1415,12 +1495,12 @@ app.post("/api/extract-video-frames", async (req, res) => {
           `${logPrefix} frame_extract_success extractor=${sourceExtractor} extracted=${localAttempt.extractedFrameCount}/${localAttempt.requestedFrameCount}`
         );
 
-        const transcript = shouldIncludeTranscript
-          ? await buildVideoTranscript(downloaded.filePath, requestId, normalizedTranscriptMaxSeconds)
-          : {
-              available: false,
-              error: "transcript disabled by request",
-            };
+        const [transcript, r2VideoUrl] = await Promise.all([
+          shouldIncludeTranscript
+            ? buildVideoTranscript(downloaded.filePath, requestId, normalizedTranscriptMaxSeconds)
+            : Promise.resolve({ available: false, error: "transcript disabled by request" }),
+          uploadVideoFileToR2(downloaded.filePath, collectionId, requestId),
+        ]);
 
         return res.json({
           requestId,
@@ -1428,6 +1508,7 @@ app.post("/api/extract-video-frames", async (req, res) => {
           platform: resolvedPlatform,
           sourceUrl: extractionUrl,
           videoUrl: extractionUrl,
+          r2VideoUrl: r2VideoUrl || null,
           title,
           description,
           durationSeconds: localAttempt.durationSeconds,
