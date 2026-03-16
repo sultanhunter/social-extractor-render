@@ -3,6 +3,7 @@ const { randomUUID } = require("node:crypto");
 const { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } = require("node:fs");
 const { resolve, join, extname } = require("node:path");
 const { tmpdir } = require("node:os");
+const os = require("node:os");
 const { promisify } = require("node:util");
 
 const cors = require("cors");
@@ -28,10 +29,10 @@ const r2Configured = Boolean(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCE
 
 const r2Client = r2Configured
   ? new S3Client({
-      region: "auto",
-      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
-    })
+    region: "auto",
+    endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+  })
   : null;
 
 function encodeR2KeyForPublicUrl(key) {
@@ -1621,6 +1622,85 @@ app.post("/api/extract-video-frames", async (req, res) => {
     details: errors,
     requestId,
   });
+});
+
+app.post("/api/extract-single-frame", async (req, res) => {
+  const requestId = randomUUID().slice(0, 8);
+  const logPrefix = getLogPrefix(requestId);
+  if (!authorizeRequest(req, res, requestId)) return;
+
+  const { url, platform, sessionId, timeSeconds } = req.body || {};
+
+  if (typeof url !== "string" || !url.trim()) {
+    console.warn(`${logPrefix} validation_failed missing url`);
+    return res.status(400).json({ error: "url is required", requestId });
+  }
+
+  const resolvedPlatform =
+    typeof platform === "string" && platform.trim() ? platform.trim().toLowerCase() : extractPlatform(url);
+
+  const safeSessionId = typeof sessionId === "string" && sessionId.trim() ? sessionId : undefined;
+  const extractionUrl =
+    resolvedPlatform === "tiktok"
+      ? await resolveTikTokUrl(url, requestId, safeSessionId)
+      : String(url).trim();
+
+  const targetTime = typeof timeSeconds === "number" && timeSeconds >= 0 ? timeSeconds : 0;
+
+  console.log(
+    `${logPrefix} extract_single_frame_start platform=${resolvedPlatform} session=${safeSessionId || "none"} timeSeconds=${targetTime} url=${extractionUrl}`
+  );
+
+  let downloaded = null;
+  try {
+    downloaded = await downloadVideoViaYtDlp(extractionUrl, resolvedPlatform, requestId, safeSessionId);
+
+    const tempDir = os ? os.tmpdir() : "/tmp";
+    const filename = `single-frame-${Date.now()}-${randomUUID().slice(0, 8)}.jpg`;
+    const outputPath = join(tempDir, filename);
+
+    const args = [
+      "-v", "error",
+      "-ss", String(targetTime),
+      "-i", downloaded.filePath,
+      "-frames:v", "1",
+      "-q:v", "2",
+      "-y",
+      outputPath
+    ];
+
+    await execFileAsync("ffmpeg", args, { timeout: 60000 });
+
+    if (!existsSync(outputPath)) {
+      throw new Error("FFmpeg completed but no image was created");
+    }
+
+    const imageBuffer = readFileSync(outputPath);
+    const base64Data = imageBuffer.toString("base64");
+
+    rmSync(outputPath, { force: true });
+
+    console.log(`${logPrefix} extract_single_frame_success timeSeconds=${targetTime} size=${imageBuffer.length}`);
+
+    return res.json({
+      requestId,
+      platform: resolvedPlatform,
+      sourceUrl: extractionUrl,
+      timeSeconds: targetTime,
+      mimeType: "image/jpeg",
+      data: `data:image/jpeg;base64,${base64Data}`,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "single frame extraction failed";
+    console.error(`${logPrefix} extract_single_frame_failed error=${message}`);
+    return res.status(422).json({
+      error: "Single frame extraction failed",
+      details: message,
+      requestId,
+    });
+  } finally {
+    if (downloaded) downloaded.cleanup();
+  }
 });
 
 async function logRuntimeDiagnostics() {
