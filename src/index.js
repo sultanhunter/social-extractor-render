@@ -95,16 +95,11 @@ async function downloadAndUploadToR2(sourceUrl, platform, collectionId, requestI
   }
 }
 
-const DEFAULT_FRAME_COUNT = 6;
 const MIN_FRAME_COUNT = 2;
-const MAX_FRAME_COUNT = 12;
 const DEFAULT_FRAME_WIDTH = 960;
 const MIN_FRAME_WIDTH = 480;
 const MAX_FRAME_WIDTH = 1440;
 const DEFAULT_TRANSCRIPT_ENABLED = true;
-const DEFAULT_TRANSCRIPT_MAX_SECONDS = 90;
-const MIN_TRANSCRIPT_MAX_SECONDS = 20;
-const MAX_TRANSCRIPT_MAX_SECONDS = 180;
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -254,6 +249,13 @@ function toBoundedInteger(value, fallback, min, max) {
   if (!Number.isFinite(parsed)) return fallback;
   if (parsed < min) return min;
   if (parsed > max) return max;
+  return parsed;
+}
+
+function toOptionalMinimumInteger(value, min) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed < min) return min;
   return parsed;
 }
 
@@ -759,6 +761,23 @@ function buildFrameTimestamps(durationSeconds, frameCount) {
   return dedupe(timestamps.map((item) => item.toFixed(2))).map((item) => Number.parseFloat(item));
 }
 
+function chooseAdaptiveFrameCount(durationSeconds, explicitFrameCount) {
+  if (Number.isFinite(explicitFrameCount) && explicitFrameCount > 0) {
+    return Math.max(MIN_FRAME_COUNT, Math.round(explicitFrameCount));
+  }
+
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return 24;
+  }
+
+  const duration = Math.max(1, durationSeconds);
+
+  if (duration <= 15) return Math.max(24, Math.round(duration * 2.2));
+  if (duration <= 60) return Math.max(36, Math.round(duration * 1.8));
+  if (duration <= 180) return Math.max(90, Math.round(duration * 1.4));
+  return Math.max(180, Math.round(duration * 1.1));
+}
+
 async function extractFramesFromVideoUrl(videoUrl, frameCount, frameWidth, requestId) {
   const hasVideo = await hasVideoStream(videoUrl);
   if (!hasVideo) {
@@ -766,7 +785,8 @@ async function extractFramesFromVideoUrl(videoUrl, frameCount, frameWidth, reque
   }
 
   const durationSeconds = await probeVideoDuration(videoUrl);
-  const timestamps = buildFrameTimestamps(durationSeconds, frameCount);
+  const adaptiveFrameCount = chooseAdaptiveFrameCount(durationSeconds, frameCount);
+  const timestamps = buildFrameTimestamps(durationSeconds, adaptiveFrameCount);
   const frames = [];
 
   for (let index = 0; index < timestamps.length; index += 1) {
@@ -815,7 +835,7 @@ async function extractFramesFromVideoUrl(videoUrl, frameCount, frameWidth, reque
 
   return {
     durationSeconds,
-    requestedFrameCount: frameCount,
+    requestedFrameCount: adaptiveFrameCount,
     extractedFrameCount: frames.length,
     frames,
   };
@@ -898,8 +918,6 @@ async function extractAudioBufferForTranscript(videoUrl, maxSeconds) {
     "1",
     "-ar",
     "16000",
-    "-t",
-    String(maxSeconds),
     "-f",
     "mp3",
     "-b:a",
@@ -907,9 +925,13 @@ async function extractAudioBufferForTranscript(videoUrl, maxSeconds) {
     "pipe:1",
   ];
 
+  if (Number.isFinite(maxSeconds) && maxSeconds > 0) {
+    args.splice(8, 0, "-t", String(maxSeconds));
+  }
+
   const { stdout } = await execFileAsync("ffmpeg", args, {
-    timeout: 90000,
-    maxBuffer: 20 * 1024 * 1024,
+    timeout: 600000,
+    maxBuffer: 256 * 1024 * 1024,
     encoding: "buffer",
   });
 
@@ -1401,12 +1423,7 @@ app.post("/api/extract-video-frames", async (req, res) => {
       ? await resolveTikTokUrl(url, requestId, safeSessionId)
       : String(url).trim();
 
-  const normalizedFrameCount = toBoundedInteger(
-    frameCount,
-    DEFAULT_FRAME_COUNT,
-    MIN_FRAME_COUNT,
-    MAX_FRAME_COUNT
-  );
+  const normalizedFrameCount = toOptionalMinimumInteger(frameCount, MIN_FRAME_COUNT);
   const normalizedFrameWidth = toBoundedInteger(
     frameWidth,
     DEFAULT_FRAME_WIDTH,
@@ -1414,15 +1431,10 @@ app.post("/api/extract-video-frames", async (req, res) => {
     MAX_FRAME_WIDTH
   );
   const shouldIncludeTranscript = toBoolean(includeTranscript, DEFAULT_TRANSCRIPT_ENABLED);
-  const normalizedTranscriptMaxSeconds = toBoundedInteger(
-    transcriptMaxSeconds,
-    DEFAULT_TRANSCRIPT_MAX_SECONDS,
-    MIN_TRANSCRIPT_MAX_SECONDS,
-    MAX_TRANSCRIPT_MAX_SECONDS
-  );
+  const normalizedTranscriptMaxSeconds = null;
 
   console.log(
-    `${logPrefix} frame_extract_start platform=${resolvedPlatform} session=${safeSessionId || "none"} frameCount=${normalizedFrameCount} frameWidth=${normalizedFrameWidth} url=${extractionUrl}`
+    `${logPrefix} frame_extract_start platform=${resolvedPlatform} session=${safeSessionId || "none"} frameCount=${normalizedFrameCount || "auto"} frameWidth=${normalizedFrameWidth} transcriptMaxSeconds=full url=${extractionUrl}`
   );
 
   const errors = [];

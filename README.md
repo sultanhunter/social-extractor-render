@@ -36,10 +36,10 @@ Standalone extractor service for Instagram/TikTok media URLs using `gallery-dl` 
 }
 ```
 
-- `frameCount` optional (`2-12`, default `6`)
+- `frameCount` optional (`>=2`). If omitted, extractor auto-selects frame count based on full video duration for richer visual coverage.
 - `frameWidth` optional (`480-1440`, default `960`)
 - `includeTranscript` optional (`true/false`, default `true`)
-- `transcriptMaxSeconds` optional (`20-180`, default `90`)
+- `transcriptMaxSeconds` optional. If omitted, full audio duration is transcribed.
 
 Response includes:
 
