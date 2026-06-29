@@ -10,6 +10,7 @@ const cors = require("cors");
 const dotenv = require("dotenv");
 const express = require("express");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { installMuslimahCarouselRoutes } = require("./muslimah-carousel");
 
 dotenv.config();
 
@@ -393,6 +394,8 @@ function authorizeRequest(req, res, requestId) {
 
   return true;
 }
+
+installMuslimahCarouselRoutes(app, { authorizeRequest, getLogPrefix });
 
 function extractPlatform(url) {
   const normalized = String(url).toLowerCase();
