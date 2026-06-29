@@ -515,21 +515,44 @@ async function uploadImageToR2(buffer, collectionId, hook, slideNumber) {
   return `${r2.publicUrl}/${encodeR2Key(key)}`;
 }
 
-async function generateImages({ script, imageModel, referenceImagePaths, collectionId }) {
+async function generateImages({ script, imageModel, referenceImagePaths, collectionId, onProgress }) {
   const images = [];
   for (const slide of script.slides) {
     const prompt = buildSlidePrompt(script, slide);
+    await onProgress?.({
+      stage: "image_generation_started",
+      message: `Generating slide ${slide.slideNumber} ${slide.slideType} image with ${imageModel || IMAGE_MODEL}.`,
+      slideNumber: slide.slideNumber,
+      progress: 20 + ((slide.slideNumber - 1) / script.slides.length) * 65,
+    });
+    const imageStartedAt = Date.now();
     const imageBuffer = await createImage({
       model: imageModel || IMAGE_MODEL,
       prompt,
       referenceImagePaths,
     });
+    await onProgress?.({
+      stage: "image_generated",
+      message: `Slide ${slide.slideNumber} image generated. Uploading to R2.`,
+      slideNumber: slide.slideNumber,
+      progress: 22 + ((slide.slideNumber - 1) / script.slides.length) * 65,
+      elapsedMs: Date.now() - imageStartedAt,
+    });
+    const uploadStartedAt = Date.now();
     const imageUrl = await uploadImageToR2(imageBuffer, collectionId, script.hook, slide.slideNumber);
     images.push({
       slideNumber: slide.slideNumber,
       slideType: slide.slideType,
       imageUrl,
       prompt,
+    });
+    await onProgress?.({
+      stage: "image_uploaded",
+      message: `Slide ${slide.slideNumber} uploaded to R2.`,
+      slideNumber: slide.slideNumber,
+      progress: 20 + (slide.slideNumber / script.slides.length) * 65,
+      elapsedMs: Date.now() - uploadStartedAt,
+      details: { imageUrl },
     });
   }
   return images;
@@ -613,6 +636,36 @@ async function postCallback({ callbackUrl, callbackToken, payload }) {
   }
 }
 
+async function postProgress({ callbackUrl, callbackToken, requestId, startedAt, stage, message, progress, slideNumber, elapsedMs, level = "info", details = null }) {
+  if (!callbackUrl || !callbackToken) return;
+
+  try {
+    await postCallback({
+      callbackUrl,
+      callbackToken,
+      payload: {
+        status: "generating",
+        event: {
+          id: `${Date.now()}-${stage}-${slideNumber || "job"}`,
+          at: new Date().toISOString(),
+          stage,
+          message,
+          level,
+          slideNumber: typeof slideNumber === "number" ? slideNumber : null,
+          progress: typeof progress === "number" ? Math.max(0, Math.min(100, progress)) : null,
+          elapsedMs: typeof elapsedMs === "number" ? elapsedMs : Date.now() - startedAt,
+          details: {
+            requestId,
+            ...(details && typeof details === "object" ? details : {}),
+          },
+        },
+      },
+    });
+  } catch (error) {
+    console.warn(`[${requestId}] muslimah-carousel progress_callback_failed stage=${stage} error=${error instanceof Error ? error.message : "unknown"}`);
+  }
+}
+
 async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
   const jobId = asNonEmptyString(body.jobId);
   const callbackUrl = asNonEmptyString(body.callbackUrl);
@@ -621,23 +674,65 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
   const scriptModel = asNonEmptyString(body.scriptModel) || SCRIPT_MODEL;
   const imageModel = asNonEmptyString(body.imageModel) || IMAGE_MODEL;
   const publish = asBoolean(body.publish, false);
+  const startedAt = Date.now();
+  const progress = (event) => postProgress({ callbackUrl, callbackToken, requestId, startedAt, ...event });
 
   try {
     console.log(`${getLogPrefix(requestId)} muslimah-carousel background_start job=${jobId} publish=${publish ? "yes" : "no"}`);
-    const script = isScript(body.script)
-      ? normalizeScript(body.script, pickHookBackground(body.previousHookBackground))
-      : await generateScript({
+    await progress({
+      stage: "worker_started",
+      message: "Render worker started the muslimah carousel job.",
+      progress: 5,
+      details: { jobId, publish, scriptModel, imageModel },
+    });
+
+    let script;
+    if (isScript(body.script)) {
+      script = normalizeScript(body.script, pickHookBackground(body.previousHookBackground));
+      await progress({
+        stage: "script_reused",
+        message: "Using script JSON supplied by the caller.",
+        progress: 18,
+        details: { hookBackground: script.hookBackground, selectedFeatures: script.selectedFeatures },
+      });
+    } else {
+      await progress({
+        stage: "script_generation_started",
+        message: `Generating carousel script with ${scriptModel}.`,
+        progress: 8,
+      });
+      const scriptStartedAt = Date.now();
+      script = await generateScript({
         scriptModel,
         focus: asNonEmptyString(body.focus) || undefined,
         previousHookBackground: asNonEmptyString(body.previousHookBackground) || undefined,
         previousFeatures: asStringArray(body.previousFeatures),
       });
+      await progress({
+        stage: "script_generated",
+        message: `Script generated. Hook background: ${script.hookBackground}.`,
+        progress: 18,
+        elapsedMs: Date.now() - scriptStartedAt,
+        details: {
+          hookBackground: script.hookBackground,
+          selectedFeatures: script.selectedFeatures,
+          freshTalkingPoints: script.freshTalkingPoints,
+        },
+      });
+    }
 
     const images = await generateImages({
       script,
       imageModel,
       collectionId,
       referenceImagePaths: asStringArray(body.referenceImagePaths),
+      onProgress: progress,
+    });
+    await progress({
+      stage: "images_completed",
+      message: `Generated and uploaded ${images.length} carousel images.`,
+      progress: 90,
+      details: { imageCount: images.length },
     });
     const generation = {
       scriptModel,
@@ -647,13 +742,39 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
       script,
       images,
     };
+    if (publish) {
+      await progress({
+        stage: "publish_started",
+        message: "Publishing carousel to Instagram.",
+        progress: 94,
+      });
+    }
     const publishResult = await publishInstagram({ generation, publish });
+    if (publishResult) {
+      await progress({
+        stage: "publish_completed",
+        message: "Instagram publish completed.",
+        progress: 98,
+        details: publishResult,
+      });
+    }
 
     await postCallback({
       callbackUrl,
       callbackToken,
       payload: {
         status: "completed",
+        event: {
+          id: `${Date.now()}-completed`,
+          at: new Date().toISOString(),
+          stage: "completed",
+          message: `Carousel completed with ${images.length} generated images.`,
+          level: "info",
+          slideNumber: null,
+          progress: 100,
+          elapsedMs: Date.now() - startedAt,
+          details: { requestId, published: Boolean(publishResult) },
+        },
         result: {
           ...generation,
           generatedImages: true,
@@ -675,6 +796,17 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
         payload: {
           status: "failed",
           error: message,
+          event: {
+            id: `${Date.now()}-failed`,
+            at: new Date().toISOString(),
+            stage: "failed",
+            message,
+            level: "error",
+            slideNumber: null,
+            progress: null,
+            elapsedMs: Date.now() - startedAt,
+            details: { requestId },
+          },
         },
       });
     } catch (callbackError) {
