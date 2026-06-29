@@ -832,7 +832,25 @@ function installMuslimahCarouselRoutes(app, { authorizeRequest, getLogPrefix }) 
       }
 
       console.log(`${getLogPrefix(requestId)} muslimah-carousel accepted job=${jobId}`);
-      res.status(202).json({ jobId, status: "accepted", requestId });
+      res.status(202).json({
+        jobId,
+        status: "accepted",
+        requestId,
+        progressCallbacks: true,
+        progressStages: [
+          "worker_started",
+          "script_generation_started",
+          "script_generated",
+          "image_generation_started",
+          "image_generated",
+          "image_uploaded",
+          "images_completed",
+          "publish_started",
+          "publish_completed",
+          "completed",
+          "failed",
+        ],
+      });
 
       setImmediate(() => {
         runMuslimahCarouselJob({ body, requestId, getLogPrefix }).catch((error) => {
