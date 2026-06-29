@@ -939,7 +939,7 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
         stage: "script_reused",
         message: "Using script JSON supplied by the caller.",
         progress: 18,
-        details: { hookBackground: script.hookBackground, selectedFeatures: script.selectedFeatures },
+        details: { hookBackground: script.hookBackground, selectedFeatures: script.selectedFeatures, script },
       });
     } else {
       await progress({
@@ -974,6 +974,7 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
           hookBackground: script.hookBackground,
           selectedFeatures: script.selectedFeatures,
           freshTalkingPoints: script.freshTalkingPoints,
+          script,
         },
       });
     }
