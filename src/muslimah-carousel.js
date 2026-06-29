@@ -244,6 +244,38 @@ async function openAIRequest(endpoint, init, context = {}) {
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY.");
 
   const startedAt = Date.now();
+  let heartbeatCount = 0;
+  let heartbeatInFlight = false;
+  const heartbeatIntervalMs = Number(process.env.MUSLIMAH_CAROUSEL_OPENAI_HEARTBEAT_MS || 30000);
+  const heartbeatTimer =
+    typeof context.onHeartbeat === "function" && heartbeatIntervalMs > 0
+      ? setInterval(() => {
+          if (heartbeatInFlight) return;
+          heartbeatInFlight = true;
+          heartbeatCount += 1;
+          const elapsedMs = Date.now() - startedAt;
+          logDebug(context.requestId, "openai_request_waiting", {
+            job: context.jobId,
+            endpoint,
+            stage: context.stage,
+            model: context.model,
+            elapsedMs,
+            heartbeat: heartbeatCount,
+          });
+          Promise.resolve(context.onHeartbeat({ elapsedMs, heartbeatCount }))
+            .catch((error) => {
+              logWarn(context.requestId, "openai_heartbeat_failed", {
+                job: context.jobId,
+                endpoint,
+                stage: context.stage,
+                error: error instanceof Error ? error.message : "unknown",
+              });
+            })
+            .finally(() => {
+              heartbeatInFlight = false;
+            });
+        }, heartbeatIntervalMs)
+      : null;
   logDebug(context.requestId, "openai_request_start", {
     job: context.jobId,
     endpoint,
@@ -251,44 +283,48 @@ async function openAIRequest(endpoint, init, context = {}) {
     model: context.model,
   });
 
-  const response = await fetch(`${OPENAI_BASE_URL}${endpoint}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      ...(init.headers || {}),
-    },
-  });
-  const raw = await response.text();
-  let payload;
   try {
-    payload = raw ? JSON.parse(raw) : {};
-  } catch {
-    payload = {};
-  }
-  const elapsedMs = Date.now() - startedAt;
-  logDebug(context.requestId, "openai_request_end", {
-    job: context.jobId,
-    endpoint,
-    stage: context.stage,
-    model: context.model,
-    status: response.status,
-    elapsedMs,
-  });
-
-  if (!response.ok || payload?.error) {
-    logError(context.requestId, "openai_request_failed", {
+    const response = await fetch(`${OPENAI_BASE_URL}${endpoint}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        ...(init.headers || {}),
+      },
+    });
+    const raw = await response.text();
+    let payload;
+    try {
+      payload = raw ? JSON.parse(raw) : {};
+    } catch {
+      payload = {};
+    }
+    const elapsedMs = Date.now() - startedAt;
+    logDebug(context.requestId, "openai_request_end", {
       job: context.jobId,
       endpoint,
       stage: context.stage,
       model: context.model,
       status: response.status,
       elapsedMs,
-      error: payload?.error?.message || raw.slice(0, 180),
     });
-    throw new Error(payload?.error?.message || `OpenAI request failed with status ${response.status}.`);
-  }
 
-  return payload;
+    if (!response.ok || payload?.error) {
+      logError(context.requestId, "openai_request_failed", {
+        job: context.jobId,
+        endpoint,
+        stage: context.stage,
+        model: context.model,
+        status: response.status,
+        elapsedMs,
+        error: payload?.error?.message || raw.slice(0, 180),
+      });
+      throw new Error(payload?.error?.message || `OpenAI request failed with status ${response.status}.`);
+    }
+
+    return payload;
+  } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+  }
 }
 
 function extractOutputText(payload) {
@@ -356,7 +392,7 @@ Slide content rules:
 - Return JSON only.`;
 }
 
-async function generateScript({ scriptModel, previousHookBackground, previousFeatures, focus, requestId, jobId }) {
+async function generateScript({ scriptModel, previousHookBackground, previousFeatures, focus, requestId, jobId, onProgress }) {
   const fallbackBackground = pickHookBackground(previousHookBackground);
   const payload = await openAIRequest("/responses", {
     method: "POST",
@@ -385,7 +421,19 @@ async function generateScript({ scriptModel, previousHookBackground, previousFea
         },
       },
     }),
-  }, { requestId, jobId, stage: "script_generation", model: scriptModel || SCRIPT_MODEL });
+  }, {
+    requestId,
+    jobId,
+    stage: "script_generation",
+    model: scriptModel || SCRIPT_MODEL,
+    onHeartbeat: ({ elapsedMs }) =>
+      onProgress?.({
+        stage: "script_generation_waiting",
+        message: `Still waiting for ${scriptModel || SCRIPT_MODEL} script response (${Math.round(elapsedMs / 1000)}s).`,
+        progress: 10,
+        elapsedMs,
+      }),
+  });
 
   return normalizeScript(JSON.parse(extractOutputText(payload)), fallbackBackground);
 }
@@ -493,8 +541,16 @@ function getReferenceImagePaths(inputPaths) {
   return inputPaths && inputPaths.length > 0 ? inputPaths : envPaths && envPaths.length > 0 ? envPaths : DEFAULT_REFERENCE_IMAGE_PATHS;
 }
 
-async function createImage({ model, prompt, referenceImagePaths, requestId, jobId, slideNumber }) {
+async function createImage({ model, prompt, referenceImagePaths, requestId, jobId, slideNumber, progressBase, onProgress }) {
   const references = getReferenceImagePaths(referenceImagePaths);
+  const heartbeat = ({ elapsedMs }) =>
+    onProgress?.({
+      stage: "image_generation_waiting",
+      message: `Still waiting for ${model} slide ${slideNumber} image response (${Math.round(elapsedMs / 1000)}s).`,
+      slideNumber,
+      progress: progressBase,
+      elapsedMs,
+    });
   logDebug(requestId, "image_request_prepare", {
     job: jobId,
     slide: slideNumber,
@@ -516,7 +572,7 @@ async function createImage({ model, prompt, referenceImagePaths, requestId, jobI
         output_format: "png",
         n: 1,
       }),
-    }, { requestId, jobId, stage: `image_generation_slide_${slideNumber}`, model });
+    }, { requestId, jobId, stage: `image_generation_slide_${slideNumber}`, model, onHeartbeat: heartbeat });
     const base64 = payload?.data?.[0]?.b64_json;
     if (!base64) throw new Error("OpenAI image generation returned no image bytes.");
     return Buffer.from(base64, "base64");
@@ -542,7 +598,7 @@ async function createImage({ model, prompt, referenceImagePaths, requestId, jobI
   const payload = await openAIRequest(
     "/images/edits",
     { method: "POST", body: form },
-    { requestId, jobId, stage: `image_edit_slide_${slideNumber}`, model }
+    { requestId, jobId, stage: `image_edit_slide_${slideNumber}`, model, onHeartbeat: heartbeat }
   );
   const base64 = payload?.data?.[0]?.b64_json;
   if (!base64) throw new Error("OpenAI image edit returned no image bytes.");
@@ -636,6 +692,8 @@ async function generateImages({ script, imageModel, referenceImagePaths, collect
       requestId,
       jobId,
       slideNumber: slide.slideNumber,
+      progressBase: 20 + ((slide.slideNumber - 1) / script.slides.length) * 65,
+      onProgress,
     });
     await onProgress?.({
       stage: "image_generated",
@@ -658,7 +716,11 @@ async function generateImages({ script, imageModel, referenceImagePaths, collect
       slideNumber: slide.slideNumber,
       progress: 20 + (slide.slideNumber / script.slides.length) * 65,
       elapsedMs: Date.now() - uploadStartedAt,
-      details: { imageUrl },
+      details: {
+        imageUrl,
+        slideType: slide.slideType,
+        prompt,
+      },
     });
     logDebug(requestId, "slide_done", {
       job: jobId,
@@ -894,6 +956,7 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
         previousFeatures: asStringArray(body.previousFeatures),
         requestId,
         jobId,
+        onProgress: progress,
       });
       logDebug(requestId, "script_generation_done", {
         job: jobId,
