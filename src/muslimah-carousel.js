@@ -120,6 +120,41 @@ function asStringArray(value) {
   return value.filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean);
 }
 
+function safeUrlLabel(value) {
+  const url = asNonEmptyString(value);
+  if (!url) return "missing";
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "invalid-url";
+  }
+}
+
+function logDebug(requestId, message, fields = {}) {
+  const meta = Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(" ");
+  console.log(`[${requestId || "no-request"}] muslimah-carousel ${message}${meta ? ` ${meta}` : ""}`);
+}
+
+function logWarn(requestId, message, fields = {}) {
+  const meta = Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(" ");
+  console.warn(`[${requestId || "no-request"}] muslimah-carousel ${message}${meta ? ` ${meta}` : ""}`);
+}
+
+function logError(requestId, message, fields = {}) {
+  const meta = Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(" ");
+  console.error(`[${requestId || "no-request"}] muslimah-carousel ${message}${meta ? ` ${meta}` : ""}`);
+}
+
 function isScript(value) {
   return Boolean(value && typeof value === "object" && value.brand === "muslimah.health" && Array.isArray(value.slides));
 }
@@ -204,9 +239,17 @@ function normalizeScript(raw, fallbackBackground) {
   };
 }
 
-async function openAIRequest(endpoint, init) {
+async function openAIRequest(endpoint, init, context = {}) {
   const apiKey = asNonEmptyString(process.env.OPENAI_API_KEY);
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY.");
+
+  const startedAt = Date.now();
+  logDebug(context.requestId, "openai_request_start", {
+    job: context.jobId,
+    endpoint,
+    stage: context.stage,
+    model: context.model,
+  });
 
   const response = await fetch(`${OPENAI_BASE_URL}${endpoint}`, {
     ...init,
@@ -215,9 +258,33 @@ async function openAIRequest(endpoint, init) {
       ...(init.headers || {}),
     },
   });
-  const payload = await response.json();
+  const raw = await response.text();
+  let payload;
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch {
+    payload = {};
+  }
+  const elapsedMs = Date.now() - startedAt;
+  logDebug(context.requestId, "openai_request_end", {
+    job: context.jobId,
+    endpoint,
+    stage: context.stage,
+    model: context.model,
+    status: response.status,
+    elapsedMs,
+  });
 
   if (!response.ok || payload?.error) {
+    logError(context.requestId, "openai_request_failed", {
+      job: context.jobId,
+      endpoint,
+      stage: context.stage,
+      model: context.model,
+      status: response.status,
+      elapsedMs,
+      error: payload?.error?.message || raw.slice(0, 180),
+    });
     throw new Error(payload?.error?.message || `OpenAI request failed with status ${response.status}.`);
   }
 
@@ -289,7 +356,7 @@ Slide content rules:
 - Return JSON only.`;
 }
 
-async function generateScript({ scriptModel, previousHookBackground, previousFeatures, focus }) {
+async function generateScript({ scriptModel, previousHookBackground, previousFeatures, focus, requestId, jobId }) {
   const fallbackBackground = pickHookBackground(previousHookBackground);
   const payload = await openAIRequest("/responses", {
     method: "POST",
@@ -318,7 +385,7 @@ async function generateScript({ scriptModel, previousHookBackground, previousFea
         },
       },
     }),
-  });
+  }, { requestId, jobId, stage: "script_generation", model: scriptModel || SCRIPT_MODEL });
 
   return normalizeScript(JSON.parse(extractOutputText(payload)), fallbackBackground);
 }
@@ -426,8 +493,16 @@ function getReferenceImagePaths(inputPaths) {
   return inputPaths && inputPaths.length > 0 ? inputPaths : envPaths && envPaths.length > 0 ? envPaths : DEFAULT_REFERENCE_IMAGE_PATHS;
 }
 
-async function createImage({ model, prompt, referenceImagePaths }) {
+async function createImage({ model, prompt, referenceImagePaths, requestId, jobId, slideNumber }) {
   const references = getReferenceImagePaths(referenceImagePaths);
+  logDebug(requestId, "image_request_prepare", {
+    job: jobId,
+    slide: slideNumber,
+    model,
+    referenceCount: references.length,
+    mode: references.length === 0 ? "generation" : "edit",
+    promptChars: prompt.length,
+  });
 
   if (references.length === 0) {
     const payload = await openAIRequest("/images/generations", {
@@ -441,7 +516,7 @@ async function createImage({ model, prompt, referenceImagePaths }) {
         output_format: "png",
         n: 1,
       }),
-    });
+    }, { requestId, jobId, stage: `image_generation_slide_${slideNumber}`, model });
     const base64 = payload?.data?.[0]?.b64_json;
     if (!base64) throw new Error("OpenAI image generation returned no image bytes.");
     return Buffer.from(base64, "base64");
@@ -456,10 +531,19 @@ async function createImage({ model, prompt, referenceImagePaths }) {
   form.append("n", "1");
 
   for (const filePath of references) {
+    logDebug(requestId, "image_reference_attach", {
+      job: jobId,
+      slide: slideNumber,
+      file: path.basename(filePath),
+    });
     await appendImageFile(form, filePath);
   }
 
-  const payload = await openAIRequest("/images/edits", { method: "POST", body: form });
+  const payload = await openAIRequest(
+    "/images/edits",
+    { method: "POST", body: form },
+    { requestId, jobId, stage: `image_edit_slide_${slideNumber}`, model }
+  );
   const base64 = payload?.data?.[0]?.b64_json;
   if (!base64) throw new Error("OpenAI image edit returned no image bytes.");
   return Buffer.from(base64, "base64");
@@ -501,9 +585,16 @@ function slugify(input) {
     .slice(0, 80) || "flo-muslim-woman";
 }
 
-async function uploadImageToR2(buffer, collectionId, hook, slideNumber) {
+async function uploadImageToR2(buffer, collectionId, hook, slideNumber, context = {}) {
   const r2 = createR2Client();
   const key = `muslimah-health-carousels/${collectionId}/${slugify(hook)}/${Date.now()}-${randomUUID()}-slide-${slideNumber}.png`;
+  const startedAt = Date.now();
+  logDebug(context.requestId, "r2_upload_start", {
+    job: context.jobId,
+    slide: slideNumber,
+    bucket: r2.bucket,
+    bytes: buffer.byteLength,
+  });
   await r2.client.send(
     new PutObjectCommand({
       Bucket: r2.bucket,
@@ -512,13 +603,25 @@ async function uploadImageToR2(buffer, collectionId, hook, slideNumber) {
       ContentType: "image/png",
     })
   );
+  logDebug(context.requestId, "r2_upload_end", {
+    job: context.jobId,
+    slide: slideNumber,
+    elapsedMs: Date.now() - startedAt,
+    key,
+  });
   return `${r2.publicUrl}/${encodeR2Key(key)}`;
 }
 
-async function generateImages({ script, imageModel, referenceImagePaths, collectionId, onProgress }) {
+async function generateImages({ script, imageModel, referenceImagePaths, collectionId, onProgress, requestId, jobId }) {
   const images = [];
   for (const slide of script.slides) {
     const prompt = buildSlidePrompt(script, slide);
+    logDebug(requestId, "slide_start", {
+      job: jobId,
+      slide: slide.slideNumber,
+      type: slide.slideType,
+      totalSlides: script.slides.length,
+    });
     await onProgress?.({
       stage: "image_generation_started",
       message: `Generating slide ${slide.slideNumber} ${slide.slideType} image with ${imageModel || IMAGE_MODEL}.`,
@@ -530,6 +633,9 @@ async function generateImages({ script, imageModel, referenceImagePaths, collect
       model: imageModel || IMAGE_MODEL,
       prompt,
       referenceImagePaths,
+      requestId,
+      jobId,
+      slideNumber: slide.slideNumber,
     });
     await onProgress?.({
       stage: "image_generated",
@@ -539,7 +645,7 @@ async function generateImages({ script, imageModel, referenceImagePaths, collect
       elapsedMs: Date.now() - imageStartedAt,
     });
     const uploadStartedAt = Date.now();
-    const imageUrl = await uploadImageToR2(imageBuffer, collectionId, script.hook, slide.slideNumber);
+    const imageUrl = await uploadImageToR2(imageBuffer, collectionId, script.hook, slide.slideNumber, { requestId, jobId });
     images.push({
       slideNumber: slide.slideNumber,
       slideType: slide.slideType,
@@ -554,12 +660,21 @@ async function generateImages({ script, imageModel, referenceImagePaths, collect
       elapsedMs: Date.now() - uploadStartedAt,
       details: { imageUrl },
     });
+    logDebug(requestId, "slide_done", {
+      job: jobId,
+      slide: slide.slideNumber,
+      imageBytes: imageBuffer.byteLength,
+      imageUrlHost: safeUrlLabel(imageUrl),
+    });
   }
   return images;
 }
 
-async function publishInstagram({ generation, publish }) {
-  if (!publish) return null;
+async function publishInstagram({ generation, publish, requestId, jobId }) {
+  if (!publish) {
+    logDebug(requestId, "instagram_publish_skipped", { job: jobId });
+    return null;
+  }
 
   const accessToken = asNonEmptyString(process.env.INSTAGRAM_GRAPH_ACCESS_TOKEN);
   const igUserId = asNonEmptyString(process.env.INSTAGRAM_GRAPH_USER_ID);
@@ -569,8 +684,15 @@ async function publishInstagram({ generation, publish }) {
 
   const apiVersion = process.env.INSTAGRAM_GRAPH_API_VERSION || "v22.0";
   const imageUrls = generation.images.map((image) => image.imageUrl).slice(0, 10);
+  logDebug(requestId, "instagram_publish_start", {
+    job: jobId,
+    apiVersion,
+    imageCount: imageUrls.length,
+  });
 
   async function graphPost(pathname, params) {
+    const startedAt = Date.now();
+    logDebug(requestId, "instagram_graph_start", { job: jobId, pathname });
     const body = new URLSearchParams({ ...params, access_token: accessToken });
     const response = await fetch(`https://graph.facebook.com/${apiVersion}/${pathname}`, {
       method: "POST",
@@ -578,6 +700,12 @@ async function publishInstagram({ generation, publish }) {
       body,
     });
     const payload = await response.json();
+    logDebug(requestId, "instagram_graph_end", {
+      job: jobId,
+      pathname,
+      status: response.status,
+      elapsedMs: Date.now() - startedAt,
+    });
     if (!response.ok || payload?.error) {
       throw new Error(payload?.error?.message || `Instagram Graph request failed (${response.status})`);
     }
@@ -616,10 +744,19 @@ async function publishInstagram({ generation, publish }) {
   };
 }
 
-async function postCallback({ callbackUrl, callbackToken, payload }) {
+async function postCallback({ callbackUrl, callbackToken, payload, requestId, jobId }) {
   if (!callbackUrl || !callbackToken) {
     throw new Error("Missing callback URL or callback token.");
   }
+
+  const stage = payload?.event?.stage || payload?.status || "unknown";
+  const startedAt = Date.now();
+  logDebug(requestId, "callback_start", {
+    job: jobId,
+    stage,
+    status: payload?.status,
+    callback: safeUrlLabel(callbackUrl),
+  });
 
   const response = await fetch(callbackUrl, {
     method: "POST",
@@ -629,20 +766,39 @@ async function postCallback({ callbackUrl, callbackToken, payload }) {
     },
     body: JSON.stringify(payload),
   });
+  const elapsedMs = Date.now() - startedAt;
+  logDebug(requestId, "callback_end", {
+    job: jobId,
+    stage,
+    status: payload?.status,
+    httpStatus: response.status,
+    elapsedMs,
+  });
 
   if (!response.ok) {
     const raw = await response.text();
+    logError(requestId, "callback_failed_response", {
+      job: jobId,
+      stage,
+      httpStatus: response.status,
+      body: raw.slice(0, 180),
+    });
     throw new Error(`Callback request failed (${response.status}): ${raw.slice(0, 300)}`);
   }
 }
 
-async function postProgress({ callbackUrl, callbackToken, requestId, startedAt, stage, message, progress, slideNumber, elapsedMs, level = "info", details = null }) {
-  if (!callbackUrl || !callbackToken) return;
+async function postProgress({ callbackUrl, callbackToken, requestId, jobId, startedAt, stage, message, progress, slideNumber, elapsedMs, level = "info", details = null }) {
+  if (!callbackUrl || !callbackToken) {
+    logWarn(requestId, "progress_callback_skipped_missing_config", { job: jobId, stage });
+    return;
+  }
 
   try {
     await postCallback({
       callbackUrl,
       callbackToken,
+      requestId,
+      jobId,
       payload: {
         status: "generating",
         event: {
@@ -656,13 +812,25 @@ async function postProgress({ callbackUrl, callbackToken, requestId, startedAt, 
           elapsedMs: typeof elapsedMs === "number" ? elapsedMs : Date.now() - startedAt,
           details: {
             requestId,
+            jobId,
             ...(details && typeof details === "object" ? details : {}),
           },
         },
       },
     });
+    logDebug(requestId, "progress_callback_ok", {
+      job: jobId,
+      stage,
+      slide: slideNumber,
+      progress,
+    });
   } catch (error) {
-    console.warn(`[${requestId}] muslimah-carousel progress_callback_failed stage=${stage} error=${error instanceof Error ? error.message : "unknown"}`);
+    logWarn(requestId, "progress_callback_failed", {
+      job: jobId,
+      stage,
+      slide: slideNumber,
+      error: error instanceof Error ? error.message : "unknown",
+    });
   }
 }
 
@@ -675,10 +843,20 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
   const imageModel = asNonEmptyString(body.imageModel) || IMAGE_MODEL;
   const publish = asBoolean(body.publish, false);
   const startedAt = Date.now();
-  const progress = (event) => postProgress({ callbackUrl, callbackToken, requestId, startedAt, ...event });
+  const progress = (event) => postProgress({ callbackUrl, callbackToken, requestId, jobId, startedAt, ...event });
 
   try {
-    console.log(`${getLogPrefix(requestId)} muslimah-carousel background_start job=${jobId} publish=${publish ? "yes" : "no"}`);
+    logDebug(requestId, "background_start", {
+      job: jobId,
+      collection: collectionId,
+      publish: publish ? "yes" : "no",
+      scriptModel,
+      imageModel,
+      callback: safeUrlLabel(callbackUrl),
+      suppliedScript: isScript(body.script) ? "yes" : "no",
+      previousFeatures: asStringArray(body.previousFeatures).length,
+      referencePaths: asStringArray(body.referenceImagePaths).length,
+    });
     await progress({
       stage: "worker_started",
       message: "Render worker started the muslimah carousel job.",
@@ -688,7 +866,13 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
 
     let script;
     if (isScript(body.script)) {
+      logDebug(requestId, "script_reuse_start", { job: jobId });
       script = normalizeScript(body.script, pickHookBackground(body.previousHookBackground));
+      logDebug(requestId, "script_reuse_done", {
+        job: jobId,
+        hookBackground: script.hookBackground,
+        selectedFeatures: script.selectedFeatures.length,
+      });
       await progress({
         stage: "script_reused",
         message: "Using script JSON supplied by the caller.",
@@ -702,11 +886,21 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
         progress: 8,
       });
       const scriptStartedAt = Date.now();
+      logDebug(requestId, "script_generation_start", { job: jobId, model: scriptModel });
       script = await generateScript({
         scriptModel,
         focus: asNonEmptyString(body.focus) || undefined,
         previousHookBackground: asNonEmptyString(body.previousHookBackground) || undefined,
         previousFeatures: asStringArray(body.previousFeatures),
+        requestId,
+        jobId,
+      });
+      logDebug(requestId, "script_generation_done", {
+        job: jobId,
+        elapsedMs: Date.now() - scriptStartedAt,
+        hookBackground: script.hookBackground,
+        selectedFeatures: script.selectedFeatures.length,
+        freshTalkingPoints: script.freshTalkingPoints.length,
       });
       await progress({
         stage: "script_generated",
@@ -721,13 +915,21 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
       });
     }
 
+    logDebug(requestId, "image_batch_start", {
+      job: jobId,
+      slides: script.slides.length,
+      model: imageModel,
+    });
     const images = await generateImages({
       script,
       imageModel,
       collectionId,
       referenceImagePaths: asStringArray(body.referenceImagePaths),
       onProgress: progress,
+      requestId,
+      jobId,
     });
+    logDebug(requestId, "image_batch_done", { job: jobId, images: images.length });
     await progress({
       stage: "images_completed",
       message: `Generated and uploaded ${images.length} carousel images.`,
@@ -743,13 +945,14 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
       images,
     };
     if (publish) {
+      logDebug(requestId, "publish_requested", { job: jobId });
       await progress({
         stage: "publish_started",
         message: "Publishing carousel to Instagram.",
         progress: 94,
       });
     }
-    const publishResult = await publishInstagram({ generation, publish });
+    const publishResult = await publishInstagram({ generation, publish, requestId, jobId });
     if (publishResult) {
       await progress({
         stage: "publish_completed",
@@ -759,9 +962,12 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
       });
     }
 
+    logDebug(requestId, "final_callback_start", { job: jobId, images: images.length });
     await postCallback({
       callbackUrl,
       callbackToken,
+      requestId,
+      jobId,
       payload: {
         status: "completed",
         event: {
@@ -784,15 +990,27 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
       },
     });
 
-    console.log(`${getLogPrefix(requestId)} muslimah-carousel background_completed job=${jobId} images=${images.length}`);
+    logDebug(requestId, "background_completed", {
+      job: jobId,
+      images: images.length,
+      elapsedMs: Date.now() - startedAt,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to run muslimah carousel worker job.";
-    console.error(`${getLogPrefix(requestId)} muslimah-carousel background_failed job=${jobId || "none"} error=${message}`);
+    logError(requestId, "background_failed", {
+      job: jobId || "none",
+      elapsedMs: Date.now() - startedAt,
+      error: message,
+      stack: error instanceof Error ? String(error.stack || "").split("\n").slice(0, 3).join(" / ") : undefined,
+    });
 
     try {
+      logDebug(requestId, "failure_callback_start", { job: jobId });
       await postCallback({
         callbackUrl,
         callbackToken,
+        requestId,
+        jobId,
         payload: {
           status: "failed",
           error: message,
@@ -810,7 +1028,10 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
         },
       });
     } catch (callbackError) {
-      console.error(`${getLogPrefix(requestId)} muslimah-carousel callback_failed error=${callbackError instanceof Error ? callbackError.message : "unknown"}`);
+      logError(requestId, "failure_callback_failed", {
+        job: jobId,
+        error: callbackError instanceof Error ? callbackError.message : "unknown",
+      });
     }
   }
 }
@@ -818,20 +1039,34 @@ async function runMuslimahCarouselJob({ body, requestId, getLogPrefix }) {
 function installMuslimahCarouselRoutes(app, { authorizeRequest, getLogPrefix }) {
   app.post("/api/muslimah-carousel/worker", async (req, res) => {
     const requestId = randomUUID();
+    logDebug(requestId, "worker_request_received", {
+      path: req.originalUrl || req.url,
+      method: req.method,
+      contentLength: req.headers["content-length"] || "unknown",
+    });
     if (!authorizeRequest(req, res, requestId)) return;
 
     try {
       const body = req.body || {};
       const jobId = asNonEmptyString(body.jobId);
       if (!jobId) {
+        logWarn(requestId, "accept_rejected_missing_job_id");
         return res.status(400).json({ error: "Job ID is required.", requestId });
       }
 
       if (!asNonEmptyString(body.callbackUrl) || !asNonEmptyString(body.callbackToken)) {
+        logWarn(requestId, "accept_rejected_missing_callback", { job: jobId });
         return res.status(400).json({ error: "Callback URL and token are required.", jobId, requestId });
       }
 
-      console.log(`${getLogPrefix(requestId)} muslimah-carousel accepted job=${jobId}`);
+      logDebug(requestId, "accepted", {
+        job: jobId,
+        collection: asNonEmptyString(body.collectionId) || "muslimah-health",
+        callback: safeUrlLabel(body.callbackUrl),
+        publish: asBoolean(body.publish, false) ? "yes" : "no",
+        suppliedScript: isScript(body.script) ? "yes" : "no",
+        referencePaths: asStringArray(body.referenceImagePaths).length,
+      });
       res.status(202).json({
         jobId,
         status: "accepted",
@@ -852,14 +1087,19 @@ function installMuslimahCarouselRoutes(app, { authorizeRequest, getLogPrefix }) 
         ],
       });
 
+      logDebug(requestId, "background_schedule", { job: jobId });
       setImmediate(() => {
+        logDebug(requestId, "background_invoked", { job: jobId });
         runMuslimahCarouselJob({ body, requestId, getLogPrefix }).catch((error) => {
-          console.error(`${getLogPrefix(requestId)} muslimah-carousel unhandled_background_error error=${error instanceof Error ? error.message : "unknown"}`);
+          logError(requestId, "unhandled_background_error", {
+            job: jobId,
+            error: error instanceof Error ? error.message : "unknown",
+          });
         });
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to run muslimah carousel worker job.";
-      console.error(`${getLogPrefix(requestId)} muslimah-carousel accept_failed error=${message}`);
+      logError(requestId, "accept_failed", { error: message });
       res.status(500).json({ error: message, requestId });
     }
   });
