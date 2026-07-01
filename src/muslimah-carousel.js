@@ -465,8 +465,9 @@ Typography:
 - No username, no slide number, no watermark.
 
 Background:
-- Use ${script.hookBackground}.
-- Premium warm pink Muslim lifestyle flat-lay, soft sunlight, Quran/prayer-safe modest styling when relevant.
+- Use ${script.hookBackground} only as loose inspiration.
+- Choose a natural, scroll-stopping UGC-style real phone photo background that fits the hook. It can be outdoors, in a car, cafe, campus, street, gym bag, beach walk, desk, prayer mat, morning routine, window light, or any tasteful everyday Muslim lifestyle setting.
+- It does not need to be indoors. Keep it premium but real, warm, modest, and visually compatible with the exact hook typography from the reference.
 - Keep exact 9:16 portrait composition with text centered in the middle-lower third like the reference.
 - No extra words.`;
   }
@@ -539,6 +540,12 @@ function getReferenceImagePaths(inputPaths) {
     .map((item) => item.trim())
     .filter(Boolean);
   return inputPaths && inputPaths.length > 0 ? inputPaths : envPaths && envPaths.length > 0 ? envPaths : DEFAULT_REFERENCE_IMAGE_PATHS;
+}
+
+function getSlideReferenceImagePaths(slide, inputPaths) {
+  const references = getReferenceImagePaths(inputPaths);
+  if (references.length <= 1) return references;
+  return slide.slideType === "hook" ? [references[0]] : [references[1]];
 }
 
 async function createImage({ model, prompt, referenceImagePaths, requestId, jobId, slideNumber, progressBase, onProgress }) {
@@ -688,7 +695,7 @@ async function generateImages({ script, imageModel, referenceImagePaths, collect
     const imageBuffer = await createImage({
       model: imageModel || IMAGE_MODEL,
       prompt,
-      referenceImagePaths,
+      referenceImagePaths: getSlideReferenceImagePaths(slide, referenceImagePaths),
       requestId,
       jobId,
       slideNumber: slide.slideNumber,
